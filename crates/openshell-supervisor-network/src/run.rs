@@ -286,6 +286,15 @@ pub async fn run_networking(
         )
         .await?;
 
+        let upstream_proxy = crate::proxy::UpstreamProxy::from_env().map(Arc::new);
+        if let Some(ref up) = upstream_proxy {
+            info!(
+                addr = %up,
+                "Upstream proxy configured (OPENSHELL_UPSTREAM_PROXY): \
+                 public-internet connections will be tunnelled via HTTP CONNECT"
+            );
+        }
+
         let proxy_handle = ProxyHandle::start_with_bind_addr(
             proxy_policy,
             bind_addr,
@@ -298,6 +307,7 @@ pub async fn run_networking(
             Some(policy_local_ctx.clone()),
             denial_tx,
             activity_tx,
+            upstream_proxy,
             engine_ready_rx,
         )
         .await?;

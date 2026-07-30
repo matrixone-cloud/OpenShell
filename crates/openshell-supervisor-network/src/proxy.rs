@@ -172,6 +172,120 @@ impl InferenceContext {
     }
 }
 
+/// Upstream HTTP CONNECT proxy for outbound public-internet connections.
+///
+/// When `OPENSHELL_UPSTREAM_PROXY` is set in the supervisor environment the
+/// proxy tunnels outbound connections for public-internet destinations through
+/// this upstream proxy using HTTP CONNECT. Internal addresses (RFC 1918,
+/// loopback, link-local, …) always connect directly so cluster-local traffic
+/// such as Astra is unaffected. All OPA / SSRF checks still run first;
+/// the upstream proxy is only consulted after the connection is allowed.
+#[derive(Debug, Clone)]
+pub struct UpstreamProxy {
+    host: String,
+    port: u16,
+}
+
+impl std::fmt::Display for UpstreamProxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.host, self.port)
+    }
+}
+
+impl UpstreamProxy {
+    /// Parse from `OPENSHELL_UPSTREAM_PROXY` env var.
+    /// Accepts `http://host:port`, `https://host:port`, or bare `host:port`.
+    pub fn from_env() -> Option<Self> {
+        let raw = std::env::var(openshell_core::sandbox_env::UPSTREAM_PROXY).ok()?;
+        let trimmed = raw
+            .trim()
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .trim_end_matches('/');
+        let (host, port) = match trimmed.rfind(':') {
+            Some(i) => match trimmed[i + 1..].parse::<u16>() {
+                Ok(p) => (&trimmed[..i], p),
+                Err(_) => (trimmed, 3128u16),
+            },
+            None => (trimmed, 3128u16),
+        };
+        if host.is_empty() {
+            return None;
+        }
+        Some(Self {
+            host: host.to_string(),
+            port,
+        })
+    }
+}
+
+/// Connect to `host:port`, routing via an upstream HTTP CONNECT proxy when:
+///   1. `upstream` is `Some`, AND
+///   2. all resolved `addrs` are public (not internal / always-blocked).
+///
+/// Internal-destination branches (allowed_ips / exact_declared_endpoint /
+/// trusted-gateway) always produce at least one private address, so those
+/// paths always direct-connect regardless of upstream proxy configuration.
+async fn connect_upstream(
+    addrs: &[SocketAddr],
+    host: &str,
+    port: u16,
+    upstream: Option<&UpstreamProxy>,
+) -> Result<TcpStream> {
+    let all_public = addrs
+        .iter()
+        .all(|a| !is_internal_ip(a.ip()) && !is_always_blocked_ip(a.ip()));
+
+    if let (Some(proxy), true) = (upstream, all_public) {
+        let proxy_addr = format!("{}:{}", proxy.host, proxy.port);
+        let mut conn = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            TcpStream::connect(proxy_addr.as_str()),
+        )
+        .await
+        .map_err(|_| {
+            miette::miette!("upstream proxy connection timed out (10s): {proxy_addr}")
+        })?
+        .into_diagnostic()?;
+        let req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n");
+        conn.write_all(req.as_bytes()).await.into_diagnostic()?;
+
+        // Read response headers (at most 4 KiB).
+        let mut buf = vec![0u8; 4096];
+        let mut total = 0usize;
+        loop {
+            if total == buf.len() {
+                return Err(miette::miette!(
+                    "upstream proxy CONNECT response too large for {host}:{port}"
+                ));
+            }
+            let n = conn.read(&mut buf[total..]).await.into_diagnostic()?;
+            if n == 0 {
+                return Err(miette::miette!(
+                    "upstream proxy closed connection during CONNECT for {host}:{port}"
+                ));
+            }
+            total += n;
+            if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let status_end = buf[..total]
+            .iter()
+            .position(|&b| b == b'\r')
+            .unwrap_or(total);
+        let status_line = std::str::from_utf8(&buf[..status_end]).unwrap_or("");
+        if !status_line.contains("200") {
+            return Err(miette::miette!(
+                "upstream proxy rejected CONNECT {host}:{port}: {status_line}"
+            ));
+        }
+        Ok(conn)
+    } else {
+        TcpStream::connect(addrs).await.into_diagnostic()
+    }
+}
+
 #[derive(Debug)]
 pub struct ProxyHandle {
     #[allow(dead_code)]
@@ -197,6 +311,7 @@ impl ProxyHandle {
         policy_local_ctx: Option<Arc<PolicyLocalContext>>,
         denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
         activity_tx: Option<ActivitySender>,
+        upstream_proxy: Option<Arc<UpstreamProxy>>,
         engine_ready: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
@@ -283,6 +398,7 @@ impl ProxyHandle {
                         });
                         let dtx = denial_tx.clone();
                         let atx = activity_tx.clone();
+                        let uproxy = upstream_proxy.clone();
                         tokio::spawn(async move {
                             #[allow(clippy::large_futures)]
                             if let Err(err) = handle_tcp_connection(
@@ -298,6 +414,7 @@ impl ProxyHandle {
                                 dynamic_credentials,
                                 dtx,
                                 atx,
+                                uproxy,
                             )
                             .await
                             {
@@ -556,6 +673,7 @@ async fn handle_tcp_connection(
     >,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
+    upstream_proxy: Option<Arc<UpstreamProxy>>,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
     let mut used = 0usize;
@@ -604,6 +722,7 @@ async fn handle_tcp_connection(
             dynamic_credentials,
             denial_tx.as_ref(),
             activity_tx.as_ref(),
+            upstream_proxy.as_deref(),
         )
         .await;
     }
@@ -929,9 +1048,7 @@ async fn handle_tcp_connection(
         // the resolved IP in allowed_ips. Always-blocked addresses and
         // control-plane ports remain denied.
         match resolve_and_check_declared_endpoint(&host, port, sandbox_entrypoint_pid).await {
-            Ok(addrs) => TcpStream::connect(addrs.as_slice())
-                .await
-                .into_diagnostic()?,
+            Ok(addrs) => connect_upstream(&addrs, &host, port, upstream_proxy.as_deref()).await?,
             Err(reason) => {
                 {
                     let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -981,9 +1098,7 @@ async fn handle_tcp_connection(
     } else {
         // Default: reject all internal IPs (loopback, RFC 1918, link-local).
         match resolve_and_reject_internal(&host, port, sandbox_entrypoint_pid).await {
-            Ok(addrs) => TcpStream::connect(addrs.as_slice())
-                .await
-                .into_diagnostic()?,
+            Ok(addrs) => connect_upstream(&addrs, &host, port, upstream_proxy.as_deref()).await?,
             Err(reason) => {
                 {
                     let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -1589,14 +1704,37 @@ fn evaluate_opa_tcp(
 
     let identity = match resolve_process_identity(pid, peer_port, identity_cache) {
         Ok(id) => id,
-        Err(err) => {
-            return deny(
-                err.reason,
-                err.binary,
-                err.binary_pid,
-                err.ancestors,
-                vec![],
-            );
+        Err(identity_err) => {
+            // Identity resolution failed (connection not visible in /proc/<entrypoint>/net/tcp).
+            // Fall back to OPA with an empty binary path so that endpoint-only policies
+            // (no binaries constraint) can still allow the request. This handles the case
+            // where the client binary makes a direct TCP connection that bypasses the proxy
+            // environment variable but is still subject to network-namespace-level routing.
+            let input = NetworkInput {
+                host: host.to_string(),
+                port,
+                binary_path: PathBuf::default(),
+                binary_sha256: String::new(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            return match engine.evaluate_network_action_with_generation(&input) {
+                Ok((NetworkAction::Allow { matched_policy }, generation)) => ConnectDecision {
+                    action: NetworkAction::Allow { matched_policy },
+                    generation,
+                    binary: None,
+                    binary_pid: None,
+                    ancestors: vec![],
+                    cmdline_paths: vec![],
+                },
+                _ => deny(
+                    identity_err.reason,
+                    identity_err.binary,
+                    identity_err.binary_pid,
+                    identity_err.ancestors,
+                    vec![],
+                ),
+            };
         }
     };
 
@@ -3160,6 +3298,7 @@ async fn handle_forward_proxy(
     >,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<&ActivitySender>,
+    upstream_proxy: Option<&UpstreamProxy>,
 ) -> Result<()> {
     // 1. Parse the absolute-form URI. `path` is marked `mut` so that, when an
     //    L7 config applies, the canonicalized form produced below replaces it
@@ -4120,8 +4259,10 @@ async fn handle_forward_proxy(
         return Ok(());
     }
 
-    // 6. Connect upstream
-    let mut upstream = match TcpStream::connect(addrs.as_slice()).await {
+    // 6. Connect upstream (routes public-internet addresses through the upstream
+    //    proxy when OPENSHELL_UPSTREAM_PROXY is configured; internal addresses
+    //    always connect directly regardless of proxy configuration).
+    let mut upstream = match connect_upstream(&addrs, &host, port, upstream_proxy).await {
         Ok(s) => s,
         Err(e) => {
             let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())

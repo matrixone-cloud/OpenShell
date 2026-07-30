@@ -9,7 +9,7 @@ use crate::config::{
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Event as KubeEventObj, Node};
-use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams};
+use kube::api::{Api, ApiResource, DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
 use kube::runtime::watcher::{self, Event};
@@ -105,6 +105,12 @@ struct AgentSandboxApi {
 struct KubernetesSandboxDriverConfig {
     pod: KubernetesPodDriverConfig,
     containers: KubernetesDriverContainersConfig,
+    // ephemeral marks a throwaway sandbox that needs no persistent /sandbox.
+    // It skips the workspace PVC + seed init container (the ~20s tar copy of
+    // the image's /sandbox on every cold start) — the agent uses the image's
+    // own writable /sandbox layer instead. Data does not survive rescheduling,
+    // which is exactly the ephemeral contract.
+    ephemeral: bool,
 }
 
 impl KubernetesSandboxDriverConfig {
@@ -493,14 +499,19 @@ impl KubernetesComputeDriver {
             client_tls_secret_name: &self.config.client_tls_secret_name,
             host_gateway_ip: &self.config.host_gateway_ip,
             enable_user_namespaces: self.config.enable_user_namespaces,
+            sandbox_privileged: self.config.sandbox_privileged,
             app_armor_profile: self.config.app_armor_profile.as_ref(),
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
+            workspace_storage_class: &self.config.workspace_storage_class,
+            enable_lxcfs: self.config.enable_lxcfs,
+            sandbox_command: &self.config.sandbox_command,
             default_runtime_class_name: &self.config.default_runtime_class_name,
             sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
             provider_spiffe_enabled: self.config.provider_spiffe_enabled(),
             provider_spiffe_workload_api_socket_path: &self
                 .config
                 .provider_spiffe_workload_api_socket_path,
+            upstream_proxy: &self.config.upstream_proxy,
         };
         obj.data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params);
         match tokio::time::timeout(
@@ -584,6 +595,55 @@ impl KubernetesComputeDriver {
                     KUBE_API_TIMEOUT.as_secs()
                 ))
             }
+        }
+    }
+
+    pub async fn set_operating_mode(
+        &self,
+        name: &str,
+        mode: &str,
+    ) -> Result<(), KubernetesDriverError> {
+        info!(
+            sandbox_name = %name,
+            mode = %mode,
+            namespace = %self.config.namespace,
+            "Setting sandbox operating mode"
+        );
+
+        let agent_sandbox_api = self
+            .supported_agent_sandbox_api(self.client.clone())
+            .await
+            .map_err(KubernetesDriverError::Message)?;
+
+        // The community agent-sandbox-controller manages the Suspended status
+        // condition based on spec.operatingMode (Suspended=True when
+        // operatingMode==Suspended and pod is gone). Setting only operatingMode
+        // avoids the bug in the custom v0.5.0 where replicas=0 caused an early
+        // return that skipped the operatingMode=Suspended path.
+        let patch = serde_json::json!({ "spec": { "operatingMode": mode } });
+
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            agent_sandbox_api
+                .api
+                .patch(name, &PatchParams::default(), &Patch::Merge(&patch)),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                info!(sandbox_name = %name, mode = %mode, "Sandbox operating mode updated");
+                Ok(())
+            }
+            Ok(Err(KubeError::Api(err))) if err.code == 404 => {
+                Err(KubernetesDriverError::Message(format!(
+                    "sandbox '{name}' not found"
+                )))
+            }
+            Ok(Err(err)) => Err(KubernetesDriverError::from_kube(err)),
+            Err(_elapsed) => Err(KubernetesDriverError::Message(format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            ))),
         }
     }
 
@@ -1202,24 +1262,33 @@ fn apply_workspace_persistence(
 ///
 /// Provides a single PVC named "workspace" that backs the `/sandbox`
 /// directory.  The init container seeds it from the image on first use.
-fn default_workspace_volume_claim_templates(storage_size: &str) -> serde_json::Value {
+fn default_workspace_volume_claim_templates(
+    storage_size: &str,
+    storage_class: &str,
+) -> serde_json::Value {
     let size = if storage_size.is_empty() {
         DEFAULT_WORKSPACE_STORAGE_SIZE
     } else {
         storage_size
     };
+    let mut spec = serde_json::json!({
+        "accessModes": ["ReadWriteOnce"],
+        "resources": {
+            "requests": {
+                "storage": size
+            }
+        }
+    });
+    // Empty = omit the field so the cluster default StorageClass applies.
+    // PVC storageClassName is immutable, so this must be right at creation.
+    if !storage_class.is_empty() {
+        spec["storageClassName"] = serde_json::json!(storage_class);
+    }
     serde_json::json!([{
         "metadata": {
             "name": WORKSPACE_VOLUME_NAME
         },
-        "spec": {
-            "accessModes": ["ReadWriteOnce"],
-            "resources": {
-                "requests": {
-                    "storage": size
-                }
-            }
-        }
+        "spec": spec
     }])
 }
 
@@ -1239,14 +1308,23 @@ struct SandboxPodParams<'a> {
     client_tls_secret_name: &'a str,
     host_gateway_ip: &'a str,
     enable_user_namespaces: bool,
+    sandbox_privileged: bool,
     app_armor_profile: Option<&'a AppArmorProfile>,
     workspace_default_storage_size: &'a str,
+    workspace_storage_class: &'a str,
+    /// Opt-in lxcfs /proc virtualisation (requires the lxcfs DaemonSet).
+    enable_lxcfs: bool,
+    /// OPENSHELL_SANDBOX_COMMAND override; empty keeps generic semantics.
+    sandbox_command: &'a str,
     default_runtime_class_name: &'a str,
     /// Lifetime (seconds) of the projected `ServiceAccount` token used
     /// for the bootstrap `IssueSandboxToken` exchange.
     sa_token_ttl_secs: i64,
     provider_spiffe_enabled: bool,
     provider_spiffe_workload_api_socket_path: &'a str,
+    /// Value for `OPENSHELL_UPSTREAM_PROXY` injected into the sandbox pod.
+    /// Empty string disables upstream proxy routing.
+    upstream_proxy: &'a str,
 }
 
 impl Default for SandboxPodParams<'_> {
@@ -1266,12 +1344,17 @@ impl Default for SandboxPodParams<'_> {
             client_tls_secret_name: "",
             host_gateway_ip: "",
             enable_user_namespaces: false,
+            sandbox_privileged: false,
             app_armor_profile: None,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
+            workspace_storage_class: "",
+            enable_lxcfs: false,
+            sandbox_command: "",
             default_runtime_class_name: "",
             sa_token_ttl_secs: 3600,
             provider_spiffe_enabled: false,
             provider_spiffe_workload_api_socket_path: "",
+            upstream_proxy: "",
         }
     }
 }
@@ -1298,6 +1381,13 @@ fn sandbox_to_k8s_spec(
 ) -> serde_json::Value {
     let mut root = serde_json::Map::new();
 
+    // Ephemeral sandboxes opt out of the persistent workspace PVC + seed init
+    // container (see KubernetesSandboxDriverConfig.ephemeral).
+    let ephemeral = spec
+        .and_then(|s| s.template.as_ref())
+        .map(|t| kubernetes_driver_config(t).ephemeral)
+        .unwrap_or(false);
+
     if let Some(spec) = spec {
         let pod_env = spec_pod_env(Some(spec));
         if let Some(template) = spec.template.as_ref() {
@@ -1307,7 +1397,7 @@ fn sandbox_to_k8s_spec(
                     template,
                     driver_gpu_requirements(spec.resource_requirements.as_ref()),
                     &pod_env,
-                    true,
+                    !ephemeral,
                     params,
                 ),
             );
@@ -1320,10 +1410,17 @@ fn sandbox_to_k8s_spec(
         }
     }
 
-    root.insert(
-        "volumeClaimTemplates".to_string(),
-        default_workspace_volume_claim_templates(params.workspace_default_storage_size),
-    );
+    // Ephemeral sandboxes get no workspace PVC (nothing to persist), so the
+    // CRD controller does not provision or seed one.
+    if !ephemeral {
+        root.insert(
+            "volumeClaimTemplates".to_string(),
+            default_workspace_volume_claim_templates(
+                params.workspace_default_storage_size,
+                params.workspace_storage_class,
+            ),
+        );
+    }
 
     // podTemplate is required by the Kubernetes CRD - ensure it's always present
     if !root.contains_key("podTemplate") {
@@ -1507,6 +1604,8 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
         params.ssh_socket_path,
         !params.client_tls_secret_name.is_empty(),
         provider_spiffe_socket_path(params),
+        params.upstream_proxy,
+        params.sandbox_command,
     );
 
     container.insert("env".to_string(), serde_json::Value::Array(env));
@@ -1524,6 +1623,13 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
             "add": capabilities
         }
     });
+    if params.sandbox_privileged {
+        // Privileged containers receive a shared-propagation root mount from
+        // containerd, which allows `ip netns add` / `mount --make-shared` to
+        // succeed. Enable via `sandbox_privileged = true` in driver config on
+        // clusters where the runtime mounts the rootfs with rprivate propagation.
+        security_context["privileged"] = serde_json::json!(true);
+    }
     if let Some(profile) = params.app_armor_profile {
         security_context["appArmorProfile"] = app_armor_profile_to_k8s(profile);
     }
@@ -1552,6 +1658,24 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
         "mountPath": "/var/run/secrets/openshell",
         "readOnly": true,
     }));
+    // lxcfs (opt-in): bind-mount virtualised /proc files so that free -h /
+    // nproc inside the sandbox reflect cgroup limits rather than host totals.
+    // Requires the lxcfs DaemonSet on every node — gated behind enable_lxcfs
+    // so generic clusters without it can still start pods.
+    // /proc/pressure and /proc/slabinfo are intentionally excluded — containerd
+    // rejects bind mounts that target paths inside /proc on this kernel version.
+    if params.enable_lxcfs {
+        for file in &["meminfo", "cpuinfo", "stat", "diskstats", "swaps", "uptime"] {
+            volume_mounts.push(serde_json::json!({
+                "name": format!("lxcfs-proc-{}", file),
+                "mountPath": format!("/proc/{}", file),
+            }));
+        }
+        volume_mounts.push(serde_json::json!({
+            "name": "lxcfs-sys-cpu",
+            "mountPath": "/sys/devices/system/cpu",
+        }));
+    }
     container.insert(
         "volumeMounts".to_string(),
         serde_json::Value::Array(volume_mounts),
@@ -1601,6 +1725,24 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
             "defaultMode": 256
         }
     }));
+    // lxcfs hostPath volumes (opt-in) — backed by the lxcfs DaemonSet running
+    // on each node. Mount path on host: /var/lib/lxcfs-on-k8s/lxcfs/proc/<file>
+    if params.enable_lxcfs {
+        for file in &["meminfo", "cpuinfo", "stat", "diskstats", "swaps", "uptime"] {
+            volumes.push(serde_json::json!({
+                "name": format!("lxcfs-proc-{}", file),
+                "hostPath": {
+                    "path": format!("/var/lib/lxcfs-on-k8s/lxcfs/proc/{}", file),
+                }
+            }));
+        }
+        volumes.push(serde_json::json!({
+            "name": "lxcfs-sys-cpu",
+            "hostPath": {
+                "path": "/var/lib/lxcfs-on-k8s/lxcfs/sys/devices/system/cpu",
+            }
+        }));
+    }
     spec.insert("volumes".to_string(), serde_json::Value::Array(volumes));
 
     // Add hostAliases so sandbox pods can reach the Docker host.
@@ -1810,6 +1952,8 @@ fn build_env_list(
     ssh_socket_path: &str,
     tls_enabled: bool,
     provider_spiffe_socket_path: Option<&str>,
+    upstream_proxy: &str,
+    sandbox_command: &str,
 ) -> Vec<serde_json::Value> {
     let mut env = existing_env.cloned().unwrap_or_default();
     apply_env_map(&mut env, template_environment);
@@ -1833,6 +1977,8 @@ fn build_env_list(
         ssh_socket_path,
         tls_enabled,
         provider_spiffe_socket_path,
+        upstream_proxy,
+        sandbox_command,
     );
     env
 }
@@ -1856,15 +2002,22 @@ fn apply_required_env(
     ssh_socket_path: &str,
     tls_enabled: bool,
     provider_spiffe_socket_path: Option<&str>,
+    upstream_proxy: &str,
+    sandbox_command: &str,
 ) {
     upsert_env(env, openshell_core::sandbox_env::SANDBOX_ID, sandbox_id);
     upsert_env(env, openshell_core::sandbox_env::SANDBOX, sandbox_name);
     upsert_env(env, openshell_core::sandbox_env::ENDPOINT, grpc_endpoint);
-    upsert_env(
-        env,
-        openshell_core::sandbox_env::SANDBOX_COMMAND,
-        "sleep infinity",
-    );
+    // OPENSHELL_SANDBOX_COMMAND is deployment policy, not driver policy: only
+    // inject it when explicitly configured (MOI sets astra-edge here). Empty
+    // keeps the image/core default lifecycle semantics.
+    if !sandbox_command.is_empty() {
+        upsert_env(
+            env,
+            openshell_core::sandbox_env::SANDBOX_COMMAND,
+            sandbox_command,
+        );
+    }
     upsert_env(
         env,
         openshell_core::sandbox_env::TELEMETRY_ENABLED,
@@ -1911,6 +2064,13 @@ fn apply_required_env(
             socket_path,
         );
     }
+    if !upstream_proxy.is_empty() {
+        upsert_env(
+            env,
+            openshell_core::sandbox_env::UPSTREAM_PROXY,
+            upstream_proxy,
+        );
+    }
 }
 
 fn provider_spiffe_socket_path<'a>(params: &'a SandboxPodParams<'a>) -> Option<&'a str> {
@@ -1940,6 +2100,8 @@ fn upsert_env(env: &mut Vec<serde_json::Value>, name: &str, value: &str) {
     env.push(serde_json::json!({"name": name, "value": value}));
 }
 
+/// Like `upsert_env` but does NOT overwrite an existing value.
+/// Used for driver defaults that callers are allowed to override via user env.
 /// Extract a string value from the template's `platform_config` Struct.
 fn platform_config_string(template: &SandboxTemplate, key: &str) -> Option<String> {
     let config = template.platform_config.as_ref()?;
@@ -1978,7 +2140,7 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
     let status = obj.data.get("status")?;
     let status_obj = status.as_object()?;
 
-    let conditions = status_obj
+    let mut conditions = status_obj
         .get("conditions")
         .and_then(|val| val.as_array())
         .map(|items| {
@@ -1988,6 +2150,30 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+
+    // The community agent-sandbox-controller never sets a Suspended condition.
+    // Instead it marks Ready=True with reason=PodIsNotExpected when replicas=0.
+    // Synthesise a Suspended=True condition from spec.replicas so that the
+    // existing phase-derivation logic (which keys on Suspended=True) works
+    // correctly without requiring changes to derive_phase / derive_phase_for_existing.
+    let spec_replicas = obj
+        .data
+        .get("spec")
+        .and_then(|s| s.get("replicas"))
+        .and_then(|r| r.as_u64());
+    if spec_replicas == Some(0)
+        && !conditions
+            .iter()
+            .any(|c| c.r#type == "Suspended" && c.status.eq_ignore_ascii_case("true"))
+    {
+        conditions.push(SandboxCondition {
+            r#type: "Suspended".to_string(),
+            status: "True".to_string(),
+            reason: "ReplicasZero".to_string(),
+            message: "Sandbox has been suspended (replicas=0).".to_string(),
+            last_transition_time: String::new(),
+        });
+    }
 
     Some(SandboxStatus {
         sandbox_name: status_obj
@@ -2462,6 +2648,8 @@ mod tests {
             "0.0.0.0:2222",
             true, // tls_enabled
             None,
+            "",
+            "",
         );
 
         // Extract the TLS-related env vars
@@ -3665,16 +3853,138 @@ mod tests {
     }
 
     #[test]
+    fn workspace_vct_sets_storage_class_when_configured() {
+        let vct = default_workspace_volume_claim_templates("5Gi", "directpv-hdd");
+        assert_eq!(vct[0]["spec"]["storageClassName"], "directpv-hdd");
+    }
+
+    #[test]
+    fn workspace_vct_omits_storage_class_when_empty() {
+        let vct = default_workspace_volume_claim_templates("5Gi", "");
+        assert!(vct[0]["spec"].get("storageClassName").is_none());
+    }
+
+    #[test]
     fn default_workspace_vct_uses_provided_storage_size() {
-        let vct = default_workspace_volume_claim_templates("5Gi");
+        let vct = default_workspace_volume_claim_templates("5Gi", "");
         let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
         assert_eq!(storage, "5Gi");
     }
 
     #[test]
     fn default_workspace_vct_falls_back_to_const_when_empty() {
-        let vct = default_workspace_volume_claim_templates("");
+        let vct = default_workspace_volume_claim_templates("", "");
         let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
         assert_eq!(storage, DEFAULT_WORKSPACE_STORAGE_SIZE);
+    }
+
+    #[test]
+    fn upstream_proxy_injected_into_env_when_configured() {
+        let mut env = Vec::new();
+        apply_required_env(
+            &mut env,
+            "sandbox-1",
+            "my-sandbox",
+            "https://endpoint:8080",
+            "",
+            false,
+            None,
+            "http://10.222.1.111:8080",
+            "",
+        );
+        let get_env = |name: &str| -> Option<String> {
+            env.iter()
+                .find(|e| e.get("name").and_then(|v| v.as_str()) == Some(name))
+                .and_then(|e| e.get("value").and_then(|v| v.as_str()).map(String::from))
+        };
+        assert_eq!(
+            get_env(openshell_core::sandbox_env::UPSTREAM_PROXY).as_deref(),
+            Some("http://10.222.1.111:8080"),
+        );
+    }
+
+    #[test]
+    fn upstream_proxy_not_injected_when_empty() {
+        let mut env = Vec::new();
+        apply_required_env(
+            &mut env,
+            "sandbox-1",
+            "my-sandbox",
+            "https://endpoint:8080",
+            "",
+            false,
+            None,
+            "",
+            "",
+        );
+        let has_upstream = env
+            .iter()
+            .any(|e| e.get("name").and_then(|v| v.as_str()) == Some(openshell_core::sandbox_env::UPSTREAM_PROXY));
+        assert!(!has_upstream, "OPENSHELL_UPSTREAM_PROXY must not be set when upstream_proxy is empty");
+    }
+}
+
+#[cfg(test)]
+mod ephemeral_workspace_tests {
+    use super::*;
+    use prost_types::{value::Kind, Struct, Value};
+
+    fn ephemeral_driver_config() -> Struct {
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(
+            "ephemeral".to_string(),
+            Value { kind: Some(Kind::BoolValue(true)) },
+        );
+        Struct { fields }
+    }
+
+    // Ephemeral sandboxes must skip the workspace PVC and its seed init
+    // container (the ~20s tar copy on every cold start) — the biggest ephemeral
+    // startup cost. The agent uses the image's own writable /sandbox instead.
+    #[test]
+    fn ephemeral_sandbox_skips_workspace_pvc_and_seed_init() {
+        let params = SandboxPodParams {
+            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
+            ..SandboxPodParams::default()
+        };
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                driver_config: Some(ephemeral_driver_config()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let out = sandbox_to_k8s_spec(Some(&spec), &params);
+
+        assert!(
+            out["spec"].get("volumeClaimTemplates").is_none(),
+            "ephemeral sandbox must not declare a workspace PVC"
+        );
+        let init_names: Vec<&str> = out["spec"]["podTemplate"]["spec"]["initContainers"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|c| c["name"].as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            !init_names.contains(&WORKSPACE_INIT_CONTAINER_NAME),
+            "ephemeral sandbox must not inject the workspace seed init container, got {init_names:?}"
+        );
+    }
+
+    // A normal (non-ephemeral) sandbox keeps the persistent workspace.
+    #[test]
+    fn non_ephemeral_sandbox_keeps_workspace_pvc() {
+        let params = SandboxPodParams {
+            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
+            ..SandboxPodParams::default()
+        };
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate::default()),
+            ..Default::default()
+        };
+        let out = sandbox_to_k8s_spec(Some(&spec), &params);
+        assert!(
+            out["spec"].get("volumeClaimTemplates").is_some(),
+            "non-ephemeral sandbox must declare a workspace PVC"
+        );
     }
 }

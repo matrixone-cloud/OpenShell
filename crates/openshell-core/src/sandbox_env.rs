@@ -71,3 +71,18 @@ pub const K8S_SA_TOKEN_FILE: &str = "OPENSHELL_K8S_SA_TOKEN_FILE";
 /// exchanges without using SPIFFE for gateway authentication.
 pub const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET: &str =
     "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET";
+
+/// Optional upstream HTTP CONNECT proxy for sandbox egress in restricted
+/// network environments (e.g. enterprise / IDC clusters with no direct
+/// public-internet route).
+///
+/// Accepts `http://host:port`, `https://host:port`, or bare `host:port`
+/// (default port 3128 when omitted).  When set, the supervisor's built-in
+/// network proxy tunnels allowed public-internet connections through this
+/// upstream proxy via HTTP CONNECT.  Internal / RFC-1918 destinations
+/// always connect directly.  OPA policy evaluation is unchanged — denied
+/// destinations never reach the upstream proxy.
+///
+/// Set by Kubernetes (and other compute drivers) from the driver config;
+/// must not be injected via `CreateSandbox` API `environment` maps.
+pub const UPSTREAM_PROXY: &str = "OPENSHELL_UPSTREAM_PROXY";

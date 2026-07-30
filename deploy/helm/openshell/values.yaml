@@ -173,6 +173,17 @@ server:
   # Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi").
   # Empty = built-in default (2Gi).
   workspaceDefaultStorageSize: ""
+  # Kubernetes StorageClass for workspace PVCs. Empty = cluster default
+  # StorageClass; clusters WITHOUT a default StorageClass must set this or
+  # sandbox PVCs stay Pending forever (pods never schedule).
+  workspaceStorageClass: ""
+  # Opt-in lxcfs /proc virtualisation for sandbox pods. Requires an lxcfs
+  # DaemonSet exposing /var/lib/lxcfs-on-k8s/lxcfs on every node; pods fail to
+  # start without it, so keep false unless the DaemonSet is deployed.
+  enableLxcfs: false
+  # OPENSHELL_SANDBOX_COMMAND injected into sandbox pods. Empty keeps the
+  # generic lifecycle default; MOI sets "/usr/local/bin/astra-edge --reconnect".
+  sandboxCommand: ""
   # -- Default Kubernetes runtimeClassName for sandbox pods.
   # Applied when a CreateSandbox request does not specify one.
   # Empty (default) = omit the field, using the cluster's default RuntimeClass.

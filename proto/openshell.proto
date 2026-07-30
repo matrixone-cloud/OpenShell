@@ -45,6 +45,12 @@ service OpenShell {
   // Delete a sandbox by name.
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
 
+  // Suspend a Kubernetes sandbox while retaining its identity and PVCs.
+  rpc SuspendSandbox(SuspendSandboxRequest) returns (SandboxResponse);
+
+  // Resume a suspended Kubernetes sandbox.
+  rpc ResumeSandbox(ResumeSandboxRequest) returns (SandboxResponse);
+
   // Create a short-lived SSH session for a sandbox.
   rpc CreateSshSession(CreateSshSessionRequest) returns (CreateSshSessionResponse);
 
@@ -422,6 +428,9 @@ enum SandboxPhase {
   SANDBOX_PHASE_ERROR = 3;
   SANDBOX_PHASE_DELETING = 4;
   SANDBOX_PHASE_UNKNOWN = 5;
+  SANDBOX_PHASE_SUSPENDING = 6;
+  SANDBOX_PHASE_SUSPENDED = 7;
+  SANDBOX_PHASE_RESUMING = 8;
 }
 
 // Public platform event exposed on the sandbox watch stream.
@@ -497,6 +506,16 @@ message DetachSandboxProviderRequest {
 
 // Delete sandbox request.
 message DeleteSandboxRequest {
+  // Sandbox name (canonical lookup key).
+  string name = 1;
+}
+
+message SuspendSandboxRequest {
+  // Sandbox name (canonical lookup key).
+  string name = 1;
+}
+
+message ResumeSandboxRequest {
   // Sandbox name (canonical lookup key).
   string name = 1;
 }

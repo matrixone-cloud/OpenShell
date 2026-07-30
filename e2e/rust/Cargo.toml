@@ -83,6 +83,11 @@ path = "tests/user_namespaces.rs"
 required-features = ["e2e-kubernetes"]
 
 [[test]]
+name = "sandbox_suspend_resume"
+path = "tests/sandbox_suspend_resume.rs"
+required-features = ["e2e-kubernetes"]
+
+[[test]]
 name = "host_gateway_alias"
 path = "tests/host_gateway_alias.rs"
 required-features = ["e2e-host-gateway"]

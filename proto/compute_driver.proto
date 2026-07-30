@@ -35,6 +35,9 @@ service ComputeDriver {
   // Stop platform resources for a sandbox without deleting its record.
   rpc StopSandbox(StopSandboxRequest) returns (StopSandboxResponse);
 
+  // Resume platform resources for a stopped sandbox.
+  rpc ResumeSandbox(ResumeSandboxRequest) returns (ResumeSandboxResponse);
+
   // Tear down platform resources for a sandbox.
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
 
@@ -248,6 +251,15 @@ message StopSandboxRequest {
 }
 
 message StopSandboxResponse {}
+
+message ResumeSandboxRequest {
+  // Stable sandbox ID stored by the gateway.
+  string sandbox_id = 1;
+  // Compute-runtime name used by the driver.
+  string sandbox_name = 2;
+}
+
+message ResumeSandboxResponse {}
 
 message DeleteSandboxRequest {
   // Stable sandbox ID stored by the gateway.

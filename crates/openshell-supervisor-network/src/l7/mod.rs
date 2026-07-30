@@ -446,10 +446,14 @@ fn validate_host_wildcard(errors: &mut Vec<String>, loc: &str, host: &str) {
         return;
     }
 
-    if host == "*" || host == "**" {
+    if host == "*" {
         errors.push(format!(
             "{loc}: host wildcard '{host}' matches all hosts; use specific patterns like '*.example.com'"
         ));
+        return;
+    }
+    // "**" is an explicit allow-all sentinel for unrestricted mode; OPA handles it correctly.
+    if host == "**" {
         return;
     }
 

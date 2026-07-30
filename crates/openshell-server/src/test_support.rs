@@ -9,9 +9,10 @@ use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServ
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DriverSandbox, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
-    GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest,
-    StopSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
-    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_server::ComputeDriver,
+    GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse, ResumeSandboxRequest,
+    ResumeSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
+    compute_driver_server::ComputeDriver,
 };
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -272,6 +273,13 @@ impl ComputeDriver for FakeComputeDriver {
             });
         });
         Ok(Response::new(StopSandboxResponse {}))
+    }
+
+    async fn resume_sandbox(
+        &self,
+        _request: Request<ResumeSandboxRequest>,
+    ) -> Result<Response<ResumeSandboxResponse>, Status> {
+        Ok(Response::new(ResumeSandboxResponse {}))
     }
 
     async fn delete_sandbox(

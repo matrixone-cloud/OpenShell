@@ -102,6 +102,14 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET")]
     provider_spiffe_workload_api_socket_path: Option<String>,
+
+    /// Optional upstream HTTP CONNECT proxy for sandbox egress in restricted
+    /// network environments.  Accepts `http://host:port`, `https://host:port`,
+    /// or bare `host:port` (default port 3128).  When set, the supervisor
+    /// tunnels allowed public-internet connections through this proxy.
+    /// Internal / RFC-1918 destinations always connect directly.
+    #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY")]
+    upstream_proxy: Option<String>,
 }
 
 #[tokio::main]
@@ -137,12 +145,20 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| {
             openshell_driver_kubernetes::DEFAULT_WORKSPACE_STORAGE_SIZE.to_string()
         }),
+        workspace_storage_class: std::env::var("OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS")
+            .unwrap_or_default(),
+        enable_lxcfs: std::env::var("OPENSHELL_K8S_ENABLE_LXCFS")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+        sandbox_command: std::env::var("OPENSHELL_K8S_SANDBOX_COMMAND").unwrap_or_default(),
         default_runtime_class_name: std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")
             .unwrap_or_default(),
         sa_token_ttl_secs: args.sa_token_ttl_secs,
         provider_spiffe_workload_api_socket_path: args
             .provider_spiffe_workload_api_socket_path
             .unwrap_or_default(),
+        sandbox_privileged: false,
+        upstream_proxy: args.upstream_proxy.unwrap_or_default(),
     })
     .await
     .into_diagnostic()?;

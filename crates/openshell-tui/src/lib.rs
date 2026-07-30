@@ -2451,6 +2451,9 @@ fn phase_label(phase: i32) -> String {
         x if x == SandboxPhase::Ready as i32 => "Ready",
         x if x == SandboxPhase::Error as i32 => "Error",
         x if x == SandboxPhase::Deleting as i32 => "Deleting",
+        x if x == SandboxPhase::Suspending as i32 => "Suspending",
+        x if x == SandboxPhase::Suspended as i32 => "Suspended",
+        x if x == SandboxPhase::Resuming as i32 => "Resuming",
         _ => "Unknown",
     }
     .to_string()

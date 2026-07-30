@@ -42,10 +42,10 @@ use openshell_core::proto::compute::v1::{
     DriverSandbox as Sandbox, DriverSandboxStatus as SandboxStatus,
     DriverSandboxTemplate as SandboxTemplate, GetCapabilitiesRequest, GetCapabilitiesResponse,
     GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
-    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
-    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
-    compute_driver_server::ComputeDriver, watch_sandboxes_event,
+    ResumeSandboxRequest, ResumeSandboxResponse, StopSandboxRequest, StopSandboxResponse,
+    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
+    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesRequest,
+    WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
@@ -2994,6 +2994,15 @@ impl ComputeDriver for VmDriver {
     ) -> Result<Response<StopSandboxResponse>, Status> {
         Err(Status::unimplemented(
             "stop sandbox is not implemented by the vm compute driver",
+        ))
+    }
+
+    async fn resume_sandbox(
+        &self,
+        _request: Request<ResumeSandboxRequest>,
+    ) -> Result<Response<ResumeSandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "resume sandbox is not implemented by the vm compute driver",
         ))
     }
 

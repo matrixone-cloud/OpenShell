@@ -148,6 +148,20 @@ impl SupervisorSessionRegistry {
         self.sessions.lock().unwrap().remove(sandbox_id);
     }
 
+    /// Remove the session for a sandbox and fire its shutdown signal so the
+    /// gRPC handler task exits promptly.  Used when resuming a suspended
+    /// sandbox: the old supervisor session (whose pod was deleted) must be
+    /// evicted before the new pod's supervisor can claim the slot.
+    pub fn remove_and_shutdown(&self, sandbox_id: &str) -> bool {
+        let previous = self.sessions.lock().unwrap().remove(sandbox_id);
+        if let Some(prev) = previous {
+            let _ = prev.shutdown.send(());
+            true
+        } else {
+            false
+        }
+    }
+
     /// Remove the session only if its `session_id` matches the one we are
     /// cleaning up. Returns `true` if the entry was removed.
     ///

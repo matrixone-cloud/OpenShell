@@ -220,6 +220,21 @@ pub struct KubernetesComputeConfig {
     )]
     pub app_armor_profile: Option<AppArmorProfile>,
     pub workspace_default_storage_size: String,
+    /// Kubernetes `StorageClass` for workspace PVCs.
+    /// Empty string (default) = omit `storageClassName`, using the cluster
+    /// default StorageClass. Clusters without a default StorageClass MUST set
+    /// this or workspace PVCs stay Pending and sandbox pods never schedule.
+    pub workspace_storage_class: String,
+    /// Mount lxcfs-virtualised /proc files (meminfo, cpuinfo, ...) into every
+    /// sandbox so in-container tools report cgroup limits instead of host
+    /// totals. REQUIRES an lxcfs DaemonSet exposing
+    /// /var/lib/lxcfs-on-k8s/lxcfs on every node — pods fail to start without
+    /// it, so this is opt-in (default false).
+    pub enable_lxcfs: bool,
+    /// Value injected as OPENSHELL_SANDBOX_COMMAND into sandbox pods. Empty
+    /// (default) leaves the generic lifecycle semantics untouched; MOI
+    /// deployments set "/usr/local/bin/astra-edge --reconnect".
+    pub sandbox_command: String,
     /// Default Kubernetes `runtimeClassName` for sandbox pods.
     /// Applied when a `CreateSandbox` request does not specify one.
     /// Empty string (default) = omit the field, using the cluster default.
@@ -241,6 +256,38 @@ pub struct KubernetesComputeConfig {
         deserialize_with = "deserialize_provider_spiffe_workload_api_socket_path"
     )]
     pub provider_spiffe_workload_api_socket_path: String,
+    /// Run sandbox agent containers as privileged.
+    ///
+    /// When `true`, `privileged: true` is set in the sandbox container's
+    /// `securityContext`. This grants the container a shared-propagation
+    /// root mount (instead of the default `rprivate`), which allows
+    /// `ip netns add` / `mount --make-shared` to succeed inside containers
+    /// whose runtime does not otherwise permit propagation changes.
+    ///
+    /// Enable on clusters where the container runtime (e.g. containerd ≤1.7)
+    /// mounts the rootfs with `rprivate` propagation and the supervisor's
+    /// network namespace creation fails with "Permission denied".
+    ///
+    /// Default: false.
+    #[serde(default)]
+    pub sandbox_privileged: bool,
+    /// Optional upstream HTTP CONNECT proxy for sandbox egress.
+    ///
+    /// In restricted-egress environments (enterprise / IDC Kubernetes clusters
+    /// with no direct public-internet route) set this to the cluster HTTP
+    /// forward proxy, e.g. `"http://10.222.1.111:8080"`.
+    ///
+    /// When non-empty the driver injects `OPENSHELL_UPSTREAM_PROXY` into the
+    /// sandbox pod environment so the supervisor's built-in network proxy
+    /// tunnels public-internet connections through this upstream proxy via
+    /// HTTP CONNECT.  Internal / RFC-1918 destinations always connect
+    /// directly.  OPA policy evaluation is unchanged.
+    ///
+    /// Accepts `http://host:port`, `https://host:port`, or bare `host:port`
+    /// (default port 3128 when omitted).  Empty string (default) disables
+    /// upstream proxy routing.
+    #[serde(default)]
+    pub upstream_proxy: String,
 }
 
 /// Lower bound enforced by kubelet for projected SA tokens.
@@ -274,9 +321,14 @@ impl Default for KubernetesComputeConfig {
             enable_user_namespaces: false,
             app_armor_profile: None,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
+            workspace_storage_class: String::new(),
+            enable_lxcfs: false,
+            sandbox_command: String::new(),
             default_runtime_class_name: String::new(),
             sa_token_ttl_secs: 3600,
             provider_spiffe_workload_api_socket_path: String::new(),
+            sandbox_privileged: false,
+            upstream_proxy: String::new(),
         }
     }
 }
@@ -345,6 +397,19 @@ fn validate_provider_spiffe_workload_api_socket_path_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_lxcfs_disabled_and_sandbox_command_empty() {
+        let cfg = KubernetesComputeConfig::default();
+        assert!(!cfg.enable_lxcfs);
+        assert!(cfg.sandbox_command.is_empty());
+    }
+
+    #[test]
+    fn default_workspace_storage_class_is_empty() {
+        let cfg = KubernetesComputeConfig::default();
+        assert!(cfg.workspace_storage_class.is_empty());
+    }
 
     #[test]
     fn default_workspace_storage_size_is_2gi() {

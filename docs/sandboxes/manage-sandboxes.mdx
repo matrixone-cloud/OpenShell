@@ -406,6 +406,28 @@ Deleting a sandbox stops all processes, releases resources, and purges injected 
 openshell sandbox delete my-sandbox
 ```
 
+## Suspend and Resume a Sandbox
+
+Kubernetes-backed sandboxes can release their pod compute resources without
+deleting the sandbox or its workspace:
+
+```shell
+openshell sandbox suspend my-sandbox
+openshell sandbox resume my-sandbox
+```
+
+If you omit the name, each command targets the last-used sandbox. The commands
+wait until the sandbox reaches `Suspended` or `Ready`, respectively.
+
+Suspending deletes the sandbox pod while retaining the Kubernetes Sandbox
+resource and its workspace PVC. Resuming creates a new pod that mounts the same
+workspace. This is not process checkpointing: running processes, memory state,
+open connections, and files outside `/sandbox` do not survive suspension.
+
+Suspend and resume currently require the Kubernetes compute driver and an Agent
+Sandbox installation that serves the `v1beta1` Sandbox API. Other compute
+drivers return an unsupported-operation error.
+
 ## Sandbox Lifecycle
 
 Every sandbox moves through a defined set of phases:
@@ -414,6 +436,9 @@ Every sandbox moves through a defined set of phases:
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
 | Provisioning | The runtime is setting up the sandbox environment, injecting credentials, and applying your policy.                                    |
 | Ready        | The sandbox is running. The agent process is active and all isolation layers are enforced. You can connect, sync files, and view logs. |
+| Suspending   | The gateway requested suspension and is waiting for the Kubernetes controller to remove the sandbox pod.                         |
+| Suspended    | The sandbox pod is absent, while the Sandbox resource and workspace PVC remain available for a later resume.                       |
+| Resuming     | The gateway requested a new pod and is waiting for the sandbox to become ready.                                                   |
 | Error        | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details.                                   |
 | Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                  |
 

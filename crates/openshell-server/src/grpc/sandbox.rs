@@ -18,9 +18,10 @@ use openshell_core::proto::{
     DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent, ExecSandboxExit,
     ExecSandboxInput, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout, GetSandboxRequest,
     ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, Provider, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    SandboxResponse, SandboxStreamEvent, SshRelayTarget, TcpForwardFrame, TcpForwardInit,
-    TcpRelayTarget, WatchSandboxRequest, relay_open, tcp_forward_init,
+    ListSandboxesResponse, Provider, ResumeSandboxRequest, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent, SshRelayTarget,
+    SuspendSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, WatchSandboxRequest,
+    relay_open, tcp_forward_init,
 };
 use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
 use openshell_core::telemetry::{
@@ -248,6 +249,34 @@ pub(super) async fn handle_get_sandbox(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
 
     let sandbox = sandbox.ok_or_else(|| Status::not_found("sandbox not found"))?;
+    Ok(Response::new(SandboxResponse {
+        sandbox: Some(sandbox),
+    }))
+}
+
+pub(super) async fn handle_suspend_sandbox(
+    state: &Arc<ServerState>,
+    request: Request<SuspendSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
+    let name = request.into_inner().name;
+    if name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
+    let sandbox = state.compute.suspend_sandbox(&name).await?;
+    Ok(Response::new(SandboxResponse {
+        sandbox: Some(sandbox),
+    }))
+}
+
+pub(super) async fn handle_resume_sandbox(
+    state: &Arc<ServerState>,
+    request: Request<ResumeSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
+    let name = request.into_inner().name;
+    if name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
+    let sandbox = state.compute.resume_sandbox(&name).await?;
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
     }))

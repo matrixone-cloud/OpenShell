@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# kind cluster configuration for local OpenShell suspend/resume manual testing.
+# See e2e/kubernetes/kind-suspend-resume-manual-test.md.
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: openshell-kind
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "openshell.dev/workload=true"

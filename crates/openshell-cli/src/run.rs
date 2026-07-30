@@ -48,12 +48,12 @@ use openshell_core::proto::{
     ListSandboxProvidersRequest, ListSandboxesRequest, ListServicesRequest, PlatformEvent,
     PolicySource, PolicyStatus, Provider, ProviderCredentialRefreshStatus,
     ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
-    ProviderProfileImportItem, RejectDraftChunkRequest, ResourceRequirements,
+    ProviderProfileImportItem, RejectDraftChunkRequest, ResourceRequirements, ResumeSandboxRequest,
     RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
     SandboxSpec, SandboxTemplate, ServiceEndpointResponse, SetClusterInferenceRequest,
-    SettingScope, SettingValue, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest,
-    exec_sandbox_event, setting_value, tcp_forward_init,
+    SettingScope, SettingValue, SuspendSandboxRequest, TcpForwardFrame, TcpForwardInit,
+    TcpRelayTarget, UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest,
+    WatchSandboxRequest, exec_sandbox_event, setting_value, tcp_forward_init,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -120,6 +120,9 @@ fn phase_name(phase: i32) -> &'static str {
         Ok(SandboxPhase::Ready) => "Ready",
         Ok(SandboxPhase::Error) => "Error",
         Ok(SandboxPhase::Deleting) => "Deleting",
+        Ok(SandboxPhase::Suspending) => "Suspending",
+        Ok(SandboxPhase::Suspended) => "Suspended",
+        Ok(SandboxPhase::Resuming) => "Resuming",
         Ok(SandboxPhase::Unknown) | Err(_) => "Unknown",
     }
 }
@@ -3408,8 +3411,11 @@ pub async fn sandbox_list(
         let phase_colored = match SandboxPhase::try_from(sandbox.phase()) {
             Ok(SandboxPhase::Ready) => phase.green().to_string(),
             Ok(SandboxPhase::Error) => phase.red().to_string(),
-            Ok(SandboxPhase::Provisioning) => phase.yellow().to_string(),
+            Ok(SandboxPhase::Provisioning | SandboxPhase::Suspending | SandboxPhase::Resuming) => {
+                phase.yellow().to_string()
+            }
             Ok(SandboxPhase::Deleting) => phase.dimmed().to_string(),
+            Ok(SandboxPhase::Suspended) => phase.cyan().to_string(),
             _ => phase.to_string(),
         };
         let created = format_epoch_ms(sandbox.metadata.as_ref().map_or(0, |m| m.created_at_ms));
@@ -3682,6 +3688,67 @@ pub async fn sandbox_delete(
     }
 
     Ok(())
+}
+
+pub async fn sandbox_suspend(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    client
+        .suspend_sandbox(SuspendSandboxRequest {
+            name: name.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+    wait_for_sandbox_phase(&mut client, name, SandboxPhase::Suspended).await?;
+    println!("{} Suspended sandbox {name}", "✓".green().bold());
+    Ok(())
+}
+
+pub async fn sandbox_resume(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    client
+        .resume_sandbox(ResumeSandboxRequest {
+            name: name.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+    wait_for_sandbox_phase(&mut client, name, SandboxPhase::Ready).await?;
+    println!("{} Resumed sandbox {name}", "✓".green().bold());
+    Ok(())
+}
+
+async fn wait_for_sandbox_phase(
+    client: &mut crate::tls::GrpcClient,
+    name: &str,
+    target: SandboxPhase,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let response = client
+            .get_sandbox(GetSandboxRequest {
+                name: name.to_string(),
+            })
+            .await
+            .into_diagnostic()?;
+        let sandbox = response
+            .into_inner()
+            .sandbox
+            .ok_or_else(|| miette!("gateway returned no sandbox for '{name}'"))?;
+        let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+        if phase == target {
+            return Ok(());
+        }
+        if phase == SandboxPhase::Error {
+            return Err(miette!(
+                "sandbox '{name}' entered Error while waiting for {target:?}"
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(miette!(
+                "timed out waiting for sandbox '{name}' to reach {target:?}; current phase is {phase:?}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 /// Return the provider type inferred from the trailing command, if any.

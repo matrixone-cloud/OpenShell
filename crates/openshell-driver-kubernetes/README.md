@@ -23,6 +23,13 @@ driver can detect served API versions again. Driver events map Kubernetes object
 state and platform events into the shared compute-driver protobuf surface used
 by the gateway.
 
+Suspend and resume require `v1beta1`. The driver merge-patches only
+`spec.operatingMode`, setting it to `Suspended` or `Running`, and reports an
+explicit unsupported error when the selected API is `v1alpha1`. Suspension
+retains the Sandbox custom resource and workspace PVC while the Agent Sandbox
+controller removes its pod. Resumption creates a new pod; it does not restore
+process or memory state.
+
 Kubernetes API calls use explicit timeouts so gRPC handlers do not block
 indefinitely when the API server is slow or unavailable.
 

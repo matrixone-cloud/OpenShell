@@ -310,6 +310,13 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 
 The Kubernetes driver creates namespaced `agents.x-k8s.io` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. It detects the served Sandbox API at runtime, caches the selected API version for the gateway process, and uses `v1beta1` when available before falling back to `v1alpha1`, so supported Agent Sandbox installations work without version-specific operator configuration. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
 
+Sandbox suspend and resume require the `v1beta1` API and use
+`spec.operatingMode`. Suspending sets the mode to `Suspended`; the Agent Sandbox
+controller deletes the pod but retains the Sandbox resource and workspace PVC.
+Resuming sets the mode to `Running`, causing the controller to create a new pod
+with the retained PVC. The `v1alpha1` fallback supports the existing lifecycle
+operations but not suspend or resume.
+
 If Agent Sandbox is upgraded in place, restart the OpenShell gateway after the controller and CRD rollout completes so the gateway can detect the served API versions again.
 
 <Note>

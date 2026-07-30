@@ -1393,6 +1393,22 @@ enum SandboxCommands {
         all: bool,
     },
 
+    /// Suspend a Kubernetes sandbox while retaining its persistent workspace.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Suspend {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
+    /// Resume a suspended Kubernetes sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Resume {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
     /// Execute a command in a running sandbox.
     ///
     /// Runs a command inside an existing sandbox using the gRPC exec endpoint.
@@ -2803,6 +2819,14 @@ async fn main() -> Result<()> {
                         }
                         SandboxCommands::Delete { names, all } => {
                             run::sandbox_delete(endpoint, &names, all, &tls, &ctx.name).await?;
+                        }
+                        SandboxCommands::Suspend { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name)?;
+                            run::sandbox_suspend(endpoint, &name, &tls).await?;
+                        }
+                        SandboxCommands::Resume { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name)?;
+                            run::sandbox_resume(endpoint, &name, &tls).await?;
                         }
                         SandboxCommands::Connect { name, editor } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;

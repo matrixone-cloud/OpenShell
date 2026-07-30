@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helm values overlay for kind-based suspend/resume manual testing.
+# Layer on deploy/helm/openshell/ci/values-skaffold.yaml when installing the chart.
+# See e2e/kubernetes/kind-suspend-resume-manual-test.md.
+
+server:
+  sandboxImagePullPolicy: IfNotPresent
+  disableTls: true
+  auth:
+    allowUnauthenticatedUsers: true
+
+supervisor:
+  image:
+    pullPolicy: IfNotPresent
+  # kind nodes run as Docker containers (overlayfs). containerd cannot mount
+  # another overlay (ImageVolume) on top of that — causes "input/output error".
+  # Force init-container delivery which uses emptyDir instead.
+  sideloadMethod: "init-container"

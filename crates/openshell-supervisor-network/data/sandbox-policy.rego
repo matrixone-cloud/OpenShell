@@ -161,6 +161,12 @@ binary_allowed(policy, exec) if {
 	glob.match(b.path, ["/"], p)
 }
 
+# Endpoint-only policy: if no binaries are declared, allow any binary (including
+# the empty-path sentinel used when process identity cannot be resolved via /proc).
+binary_allowed(policy, _) if {
+	count(object.get(policy, "binaries", [])) == 0
+}
+
 user_declared_binary_allowed(policy, exec) if {
 	some b
 	b := policy.binaries[_]

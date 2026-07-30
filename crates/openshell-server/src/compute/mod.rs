@@ -26,9 +26,11 @@ use openshell_core::proto::compute::v1::{
     DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
     DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest,
     GpuResourceRequirements as DriverGpuResourceRequirements, ListSandboxesRequest,
-    ResourceRequirements as DriverSandboxResourceRequirements, ValidateSandboxCreateRequest,
-    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
-    compute_driver_server::ComputeDriver, watch_sandboxes_event,
+    ResourceRequirements as DriverSandboxResourceRequirements,
+    ResumeSandboxRequest as DriverResumeSandboxRequest, StopSandboxRequest,
+    ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
+    compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
+    watch_sandboxes_event,
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
@@ -229,11 +231,20 @@ impl ComputeDriver for RemoteComputeDriver {
 
     async fn stop_sandbox(
         &self,
-        request: Request<openshell_core::proto::compute::v1::StopSandboxRequest>,
+        request: Request<StopSandboxRequest>,
     ) -> Result<tonic::Response<openshell_core::proto::compute::v1::StopSandboxResponse>, Status>
     {
         let mut client = self.client();
         client.stop_sandbox(request).await
+    }
+
+    async fn resume_sandbox(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::ResumeSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::ResumeSandboxResponse>, Status>
+    {
+        let mut client = self.client();
+        client.resume_sandbox(request).await
     }
 
     async fn delete_sandbox(
@@ -601,6 +612,149 @@ impl ComputeRuntime {
 
         self.cleanup_sandbox_state(&id);
         Ok(deleted)
+    }
+
+    pub async fn suspend_sandbox(&self, name: &str) -> Result<Sandbox, Status> {
+        self.transition_kubernetes_sandbox(name, SandboxPhase::Suspending)
+            .await
+    }
+
+    pub async fn resume_sandbox(&self, name: &str) -> Result<Sandbox, Status> {
+        self.transition_kubernetes_sandbox(name, SandboxPhase::Resuming)
+            .await
+    }
+
+    async fn transition_kubernetes_sandbox(
+        &self,
+        name: &str,
+        target_phase: SandboxPhase,
+    ) -> Result<Sandbox, Status> {
+        if self.driver_kind() != Some(ComputeDriverKind::Kubernetes) {
+            return Err(Status::unimplemented(
+                "sandbox suspend and resume are only supported by the kubernetes compute driver",
+            ));
+        }
+
+        let _guard = self.sync_lock.lock().await;
+        let sandbox = self
+            .store
+            .get_message_by_name::<Sandbox>(name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let current_phase =
+            SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+
+        let idempotent = match target_phase {
+            SandboxPhase::Suspending => matches!(
+                current_phase,
+                SandboxPhase::Suspending | SandboxPhase::Suspended
+            ),
+            SandboxPhase::Resuming => {
+                matches!(current_phase, SandboxPhase::Resuming | SandboxPhase::Ready)
+            }
+            _ => false,
+        };
+        if idempotent {
+            return Ok(sandbox);
+        }
+
+        let allowed = match target_phase {
+            SandboxPhase::Suspending => current_phase == SandboxPhase::Ready,
+            SandboxPhase::Resuming => current_phase == SandboxPhase::Suspended,
+            _ => false,
+        };
+        if !allowed {
+            return Err(Status::failed_precondition(format!(
+                "cannot transition sandbox '{name}' from {current_phase:?} to {target_phase:?}"
+            )));
+        }
+
+        let sandbox_id = sandbox.object_id().to_string();
+        let sandbox_name = sandbox.object_name().to_string();
+        let updated = self
+            .store
+            .update_message_cas::<Sandbox, _>(&sandbox_id, 0, |sandbox| {
+                sandbox.set_phase(target_phase as i32);
+            })
+            .await
+            .map_err(|e| crate::grpc::persistence_error_to_status(e, "update sandbox lifecycle"))?;
+        self.sandbox_index.update_from_sandbox(&updated);
+        self.sandbox_watch_bus.notify(&sandbox_id);
+
+        // When resuming, evict any stale supervisor session that persisted
+        // from before the pod was suspended.  The old TCP connection can linger
+        // for ~30 s after pod deletion; without this eviction it would
+        // immediately promote the Resuming phase to Ready the moment the K8s
+        // watch fires (via supervisor_promoted or set_supervisor_session_state).
+        if target_phase == SandboxPhase::Resuming {
+            self.supervisor_sessions.remove_and_shutdown(&sandbox_id);
+        }
+
+        let rollback_phase = match target_phase {
+            SandboxPhase::Suspending => SandboxPhase::Ready,
+            SandboxPhase::Resuming => SandboxPhase::Suspended,
+            _ => unreachable!("lifecycle transition target is validated above"),
+        };
+        let result = match target_phase {
+            SandboxPhase::Suspending => self
+                .driver
+                .stop_sandbox(Request::new(StopSandboxRequest {
+                    sandbox_id: sandbox_id.clone(),
+                    sandbox_name: sandbox_name.clone(),
+                }))
+                .await
+                .map(|_| ()),
+            SandboxPhase::Resuming => self
+                .driver
+                .resume_sandbox(Request::new(DriverResumeSandboxRequest {
+                    sandbox_id: sandbox_id.clone(),
+                    sandbox_name: sandbox_name.clone(),
+                }))
+                .await
+                .map(|_| ()),
+            _ => unreachable!("lifecycle transition target is validated above"),
+        };
+        if let Err(err) = result {
+            match self
+                .store
+                .update_message_cas::<Sandbox, _>(&sandbox_id, 0, |sandbox| {
+                    sandbox.set_phase(rollback_phase as i32);
+                })
+                .await
+            {
+                Ok(rolled_back) => {
+                    self.sandbox_index.update_from_sandbox(&rolled_back);
+                    self.sandbox_watch_bus.notify(&sandbox_id);
+                }
+                Err(rollback_err) => {
+                    warn!(
+                        sandbox_id,
+                        sandbox_name,
+                        target_phase = ?target_phase,
+                        rollback_phase = ?rollback_phase,
+                        error = %rollback_err,
+                        "Failed to roll back sandbox lifecycle phase after driver error"
+                    );
+                }
+            }
+            return Err(Status::new(
+                err.code(),
+                format!(
+                    "transition sandbox '{sandbox_name}' to {target_phase:?} failed: {}",
+                    err.message()
+                ),
+            ));
+        }
+
+        info!(
+            sandbox_id,
+            sandbox_name,
+            old_phase = ?current_phase,
+            new_phase = ?target_phase,
+            "Requested sandbox lifecycle transition"
+        );
+        Ok(updated)
     }
 
     async fn set_sandbox_phase_deleting_with_retry(
@@ -1203,9 +1357,20 @@ impl ComputeRuntime {
                 let mut phase = incoming
                     .status
                     .as_ref()
-                    .map_or(old_phase, |status| derive_phase(Some(status)));
+                    .map_or(old_phase, |status| derive_phase_for_existing(old_phase, status));
+                // Resuming is excluded from supervisor_promoted here: the K8s watch
+                // should not advance Resuming→Ready even if a session is connected
+                // (it could be the stale session from the previous pod).  The
+                // Resuming→Ready transition is handled exclusively by
+                // set_supervisor_session_state when a new supervisor session
+                // connects.  derive_phase_for_existing also returns Resuming
+                // regardless of K8s conditions to guard against the community
+                // controller's intermediate Ready=True (DependenciesReady) state.
                 let supervisor_promoted = session_connected
-                    && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown);
+                    && matches!(
+                        phase,
+                        SandboxPhase::Provisioning | SandboxPhase::Unknown
+                    );
                 if supervisor_promoted {
                     phase = SandboxPhase::Ready;
                 }
@@ -1228,11 +1393,24 @@ impl ComputeRuntime {
                 }
 
                 if old_phase != phase {
+                    let cond_summary = incoming
+                        .status
+                        .as_ref()
+                        .map(|s| {
+                            s.conditions
+                                .iter()
+                                .map(|c| format!("{}={}", c.r#type, c.status))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .unwrap_or_default();
                     info!(
                         sandbox_id = %incoming.id,
                         sandbox_name = %sandbox_name,
                         old_phase = ?old_phase,
                         new_phase = ?phase,
+                        session_connected,
+                        conditions = %cond_summary,
                         "Sandbox phase changed"
                     );
                 }
@@ -1310,8 +1488,18 @@ impl ComputeRuntime {
 
                 let sandbox_name = sandbox.object_name().to_string();
                 if connected {
-                    ensure_supervisor_ready_status(&mut sandbox.status, &sandbox_name);
-                    sandbox.set_phase(SandboxPhase::Ready as i32);
+                    // Include Resuming: the supervisor connecting is the definitive signal
+                    // that the pod is running and usable, so we advance Resuming→Ready here.
+                    // The K8s watch no longer drives Resuming→Ready (it only handles terminal
+                    // failure detection) to avoid the community controller's intermediate
+                    // Ready=True (DependenciesReady) condition from firing prematurely.
+                    if matches!(
+                        current_phase,
+                        SandboxPhase::Provisioning | SandboxPhase::Unknown | SandboxPhase::Resuming
+                    ) {
+                        ensure_supervisor_ready_status(&mut sandbox.status, &sandbox_name);
+                        sandbox.set_phase(SandboxPhase::Ready as i32);
+                    }
                 } else if current_phase == SandboxPhase::Ready {
                     ensure_supervisor_not_ready_status(&mut sandbox.status, &sandbox_name);
                     sandbox.set_phase(SandboxPhase::Provisioning as i32);
@@ -1928,6 +2116,12 @@ fn derive_phase(status: Option<&DriverSandboxStatus>) -> SandboxPhase {
             return SandboxPhase::Deleting;
         }
 
+        if status.conditions.iter().any(|condition| {
+            condition.r#type == "Suspended" && condition.status.eq_ignore_ascii_case("true")
+        }) {
+            return SandboxPhase::Suspended;
+        }
+
         for condition in &status.conditions {
             if condition.r#type == "Ready" {
                 return if condition.status.eq_ignore_ascii_case("true") {
@@ -1947,6 +2141,90 @@ fn derive_phase(status: Option<&DriverSandboxStatus>) -> SandboxPhase {
     }
 
     SandboxPhase::Unknown
+}
+
+fn derive_phase_for_existing(
+    current_phase: SandboxPhase,
+    status: &DriverSandboxStatus,
+) -> SandboxPhase {
+    if status.deleting {
+        return SandboxPhase::Deleting;
+    }
+
+    let pod_ready = status.conditions.iter().any(|c| {
+        c.r#type == "Ready" && c.status.eq_ignore_ascii_case("true")
+    });
+    let suspended_condition = status.conditions.iter().any(|c| {
+        c.r#type == "Suspended" && c.status.eq_ignore_ascii_case("true")
+    });
+    // Finished=True is set by the community controller when the sandbox container
+    // exits after running (post-resume completion), as opposed to Suspended=True
+    // which is set when the pod is explicitly deleted during suspension.
+    // Suspended=True is never cleared by the controller, so after a resume cycle
+    // both Suspended=True and Finished=True can coexist.
+    let finished_condition = status.conditions.iter().any(|c| {
+        c.r#type == "Finished" && c.status.eq_ignore_ascii_case("true")
+    });
+
+    // When Resuming, ignore all K8s conditions.  Resuming→Ready is driven
+    // exclusively by the supervisor session connecting (handled in
+    // set_supervisor_session_state when connected=true).  This prevents:
+    //   • The community controller's intermediate Ready=True (DependenciesReady)
+    //     from advancing the phase before the pod is actually usable.
+    //   • Ready=False (SandboxSuspended) — emitted while the controller still
+    //     considers the sandbox suspended — from triggering an Error transition.
+    if current_phase == SandboxPhase::Resuming {
+        return SandboxPhase::Resuming;
+    }
+
+    // Finished=True means the pod ran and completed (exited) after a resume.
+    // Ignore the stale Suspended=True that lingers from the previous suspension.
+    if finished_condition && !pod_ready {
+        return SandboxPhase::Provisioning;
+    }
+
+    // Suspended=True with the pod not running means the controller confirmed pod
+    // deletion.  Only honour this signal when we are actively suspending or already
+    // suspended — in all other phases (Provisioning, Ready, Unknown, …) the
+    // Suspended=True condition is stale from a prior suspension cycle and must be
+    // ignored.  The community controller v0.5.0 never clears Suspended=True once
+    // set, so it coexists with Finished=True and persists across resume cycles.
+    if suspended_condition && !pod_ready {
+        match current_phase {
+            SandboxPhase::Suspending | SandboxPhase::Suspended => {
+                return SandboxPhase::Suspended;
+            }
+            _ => {} // stale condition — fall through
+        }
+    }
+
+    // pod_ready=True with Suspended=True means the Suspended condition is stale
+    // (pod came back but the controller has not yet cleared the condition).
+    // Suspending and Suspended are preserved: Suspending waits for pod deletion
+    // and Suspended must only exit via ResumeSandbox (not via stale K8s conditions).
+    if pod_ready && suspended_condition {
+        match current_phase {
+            SandboxPhase::Suspending | SandboxPhase::Suspended => return current_phase,
+            _ => return SandboxPhase::Ready,
+        }
+    }
+
+    let observed = derive_phase(Some(status));
+    match current_phase {
+        SandboxPhase::Suspending => SandboxPhase::Suspending,
+        // derive_phase returns Suspended when it sees Suspended=True, but in any
+        // phase other than Suspending/Suspended that condition is stale from a prior
+        // suspension cycle.  Filter it out so stale conditions don't cause spurious
+        // Provisioning→Suspended (or Ready→Suspended) transitions.
+        SandboxPhase::Suspended => observed,
+        _ => {
+            if observed == SandboxPhase::Suspended {
+                SandboxPhase::Provisioning
+            } else {
+                observed
+            }
+        }
+    }
 }
 
 fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Option<&SandboxSpec>) {
@@ -1981,6 +2259,7 @@ fn sandbox_phase_should_be_running(phase: SandboxPhase) -> bool {
         SandboxPhase::Unspecified
             | SandboxPhase::Provisioning
             | SandboxPhase::Ready
+            | SandboxPhase::Resuming
             | SandboxPhase::Unknown
     )
 }
@@ -2066,11 +2345,21 @@ impl ComputeDriver for NoopTestDriver {
 
     async fn stop_sandbox(
         &self,
-        _request: Request<openshell_core::proto::compute::v1::StopSandboxRequest>,
+        _request: Request<StopSandboxRequest>,
     ) -> Result<tonic::Response<openshell_core::proto::compute::v1::StopSandboxResponse>, Status>
     {
         Ok(tonic::Response::new(
             openshell_core::proto::compute::v1::StopSandboxResponse {},
+        ))
+    }
+
+    async fn resume_sandbox(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::ResumeSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::ResumeSandboxResponse>, Status>
+    {
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::ResumeSandboxResponse {},
         ))
     }
 
@@ -2118,7 +2407,8 @@ mod tests {
     use futures::stream;
     use openshell_core::proto::compute::v1::{
         CreateSandboxResponse, DeleteSandboxResponse, GetCapabilitiesResponse, GetSandboxRequest,
-        GetSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateResponse,
+        GetSandboxResponse, ResumeSandboxRequest, ResumeSandboxResponse, StopSandboxRequest,
+        StopSandboxResponse, ValidateSandboxCreateResponse,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2239,8 +2529,32 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct TestDriver {
+        driver_name: String,
         listed_sandboxes: Vec<DriverSandbox>,
         current_sandboxes: Vec<DriverSandbox>,
+        stop_error: std::sync::Mutex<Option<String>>,
+        resume_error: std::sync::Mutex<Option<String>>,
+    }
+
+    impl TestDriver {
+        fn with_driver_name(mut self, driver_name: impl Into<String>) -> Self {
+            self.driver_name = driver_name.into();
+            self
+        }
+
+        fn set_stop_error(&self, error: Option<String>) {
+            *self
+                .stop_error
+                .lock()
+                .expect("test driver stop_error poisoned") = error;
+        }
+
+        fn set_resume_error(&self, error: Option<String>) {
+            *self
+                .resume_error
+                .lock()
+                .expect("test driver resume_error poisoned") = error;
+        }
     }
 
     #[tonic::async_trait]
@@ -2252,7 +2566,11 @@ mod tests {
             _request: Request<GetCapabilitiesRequest>,
         ) -> Result<tonic::Response<GetCapabilitiesResponse>, Status> {
             Ok(tonic::Response::new(GetCapabilitiesResponse {
-                driver_name: "test-driver".to_string(),
+                driver_name: if self.driver_name.is_empty() {
+                    "test-driver".to_string()
+                } else {
+                    self.driver_name.clone()
+                },
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
             }))
@@ -2320,7 +2638,30 @@ mod tests {
             &self,
             _request: Request<StopSandboxRequest>,
         ) -> Result<tonic::Response<StopSandboxResponse>, Status> {
+            if let Some(error) = self
+                .stop_error
+                .lock()
+                .expect("test driver stop_error poisoned")
+                .clone()
+            {
+                return Err(Status::unavailable(error));
+            }
             Ok(tonic::Response::new(StopSandboxResponse {}))
+        }
+
+        async fn resume_sandbox(
+            &self,
+            _request: Request<ResumeSandboxRequest>,
+        ) -> Result<tonic::Response<ResumeSandboxResponse>, Status> {
+            if let Some(error) = self
+                .resume_error
+                .lock()
+                .expect("test driver resume_error poisoned")
+                .clone()
+            {
+                return Err(Status::unavailable(error));
+            }
+            Ok(tonic::Response::new(ResumeSandboxResponse {}))
         }
 
         async fn delete_sandbox(
@@ -2341,17 +2682,29 @@ mod tests {
     }
 
     async fn test_runtime(driver: SharedComputeDriver) -> ComputeRuntime {
-        test_runtime_with_resume(driver, None).await
+        test_runtime_with_driver_name(driver, None, "test-driver").await
     }
 
     async fn test_runtime_with_resume(
         driver: SharedComputeDriver,
         startup_resume: Option<Arc<dyn StartupResume>>,
     ) -> ComputeRuntime {
+        test_runtime_with_driver_name(driver, startup_resume, "test-driver").await
+    }
+
+    async fn test_kubernetes_runtime(driver: SharedComputeDriver) -> ComputeRuntime {
+        test_runtime_with_driver_name(driver, None, ComputeDriverKind::Kubernetes.as_str()).await
+    }
+
+    async fn test_runtime_with_driver_name(
+        driver: SharedComputeDriver,
+        startup_resume: Option<Arc<dyn StartupResume>>,
+        driver_name: &str,
+    ) -> ComputeRuntime {
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
         ComputeRuntime {
             driver,
-            driver_name: "test-driver".to_string(),
+            driver_name: driver_name.to_string(),
             shutdown_cleanup: None,
             startup_resume,
             _driver_process: None,
@@ -2551,6 +2904,322 @@ mod tests {
         };
 
         assert_eq!(derive_phase(Some(&status)), SandboxPhase::Ready);
+    }
+
+    #[test]
+    fn derive_phase_returns_suspended_for_suspended_condition() {
+        let status = make_driver_status(DriverCondition {
+            r#type: "Suspended".to_string(),
+            status: "True".to_string(),
+            reason: "PodTerminated".to_string(),
+            message: "Sandbox pod is terminated".to_string(),
+            last_transition_time: String::new(),
+        });
+        assert_eq!(derive_phase(Some(&status)), SandboxPhase::Suspended);
+    }
+
+    #[test]
+    fn derive_phase_preserves_suspending_until_controller_confirms() {
+        // Suspending is preserved while pod is still terminating (Suspended not yet set).
+        let status = make_driver_status(DriverCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: "PodNotTerminated".to_string(),
+            message: "Waiting for sandbox pod termination".to_string(),
+            last_transition_time: String::new(),
+        });
+        assert_eq!(
+            derive_phase_for_existing(SandboxPhase::Suspending, &status),
+            SandboxPhase::Suspending
+        );
+    }
+
+    #[test]
+    fn derive_phase_suspending_transitions_to_suspended_when_controller_confirms() {
+        // Once the controller sets Suspended=True (pod gone), Suspending → Suspended.
+        let status = DriverSandboxStatus {
+            conditions: vec![
+                DriverCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "DependenciesNotReady".to_string(),
+                    message: "Pod does not exist".to_string(),
+                    last_transition_time: String::new(),
+                },
+                DriverCondition {
+                    r#type: "Suspended".to_string(),
+                    status: "True".to_string(),
+                    reason: "PodTerminated".to_string(),
+                    message: "Sandbox pod is terminated".to_string(),
+                    last_transition_time: String::new(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            derive_phase_for_existing(SandboxPhase::Suspending, &status),
+            SandboxPhase::Suspended
+        );
+    }
+
+    #[test]
+    fn derive_phase_stale_suspended_condition_cleared_by_pod_ready() {
+        // When the pod is running (Ready=True) but Suspended=True is still set
+        // (stale from a previous suspend that hasn't been cleared yet), phase
+        // should be Ready, not Suspended.
+        let status = DriverSandboxStatus {
+            conditions: vec![
+                DriverCondition {
+                    r#type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    reason: "DependenciesReady".to_string(),
+                    message: "Pod is running".to_string(),
+                    last_transition_time: String::new(),
+                },
+                DriverCondition {
+                    r#type: "Suspended".to_string(),
+                    status: "True".to_string(),
+                    reason: "PodTerminated".to_string(),
+                    message: "stale".to_string(),
+                    last_transition_time: String::new(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            derive_phase_for_existing(SandboxPhase::Ready, &status),
+            SandboxPhase::Ready
+        );
+    }
+
+    #[test]
+    fn derive_phase_preserves_resuming_until_ready() {
+        let status = make_driver_status(DriverCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: "DependenciesNotReady".to_string(),
+            message: "Waiting for sandbox pod".to_string(),
+            last_transition_time: String::new(),
+        });
+        assert_eq!(
+            derive_phase_for_existing(SandboxPhase::Resuming, &status),
+            SandboxPhase::Resuming
+        );
+    }
+
+    #[test]
+    fn derive_phase_resuming_ignores_stale_suspended_condition() {
+        // After a suspend, Suspended=True is set. When the user resumes, the
+        // condition may still be True while the new pod is starting. The phase
+        // must stay Resuming, not revert to Suspended.
+        let status = make_driver_status(DriverCondition {
+            r#type: "Suspended".to_string(),
+            status: "True".to_string(),
+            reason: "PodTerminated".to_string(),
+            message: "Sandbox pod is terminated".to_string(),
+            last_transition_time: String::new(),
+        });
+        assert_eq!(
+            derive_phase_for_existing(SandboxPhase::Resuming, &status),
+            SandboxPhase::Resuming
+        );
+    }
+
+    #[test]
+    fn derive_phase_resuming_ignores_ready_true_from_k8s() {
+        // Resuming→Ready is driven by the supervisor connecting, not K8s conditions.
+        // The community controller emits Ready=True (DependenciesReady) both as an
+        // intermediate state (before the pod starts) and when the pod is running.
+        // derive_phase_for_existing must stay Resuming in both cases so the
+        // Resuming state is observable while the pod initialises.
+        let status = DriverSandboxStatus {
+            instance_id: "agent-pod-abc123".to_string(),
+            conditions: vec![
+                DriverCondition {
+                    r#type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    reason: "DependenciesReady".to_string(),
+                    message: "Pod is Ready".to_string(),
+                    last_transition_time: String::new(),
+                },
+                DriverCondition {
+                    r#type: "Suspended".to_string(),
+                    status: "True".to_string(),
+                    reason: "PodTerminated".to_string(),
+                    message: "stale".to_string(),
+                    last_transition_time: String::new(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            derive_phase_for_existing(SandboxPhase::Resuming, &status),
+            SandboxPhase::Resuming
+        );
+
+        // In non-Resuming, non-Suspending, non-Suspended phases, a stale
+        // Suspended=True (pod not running) must NOT route to Suspended.
+        // The legitimate Suspended path is: SuspendSandbox → Suspending →
+        // (controller confirms via Suspended=True) → Suspended.
+        let mut non_resuming = status.clone();
+        non_resuming.conditions[0].status = "False".to_string();
+        assert_eq!(
+            derive_phase_for_existing(SandboxPhase::Ready, &non_resuming),
+            SandboxPhase::Provisioning
+        );
+    }
+
+    #[test]
+    fn derive_phase_resuming_stays_resuming_on_intermediate_dependencies_ready() {
+        // The community controller emits Ready=True (reason=DependenciesReady)
+        // before the pod actually starts.  Phase must stay Resuming regardless.
+        let status = DriverSandboxStatus {
+            instance_id: String::new(),
+            conditions: vec![DriverCondition {
+                r#type: "Ready".to_string(),
+                status: "True".to_string(),
+                reason: "DependenciesReady".to_string(),
+                message: "Prerequisites met, pod creation in progress".to_string(),
+                last_transition_time: String::new(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            derive_phase_for_existing(SandboxPhase::Resuming, &status),
+            SandboxPhase::Resuming
+        );
+    }
+
+    #[test]
+    fn derive_phase_resuming_ignores_ready_false_sandbox_suspended() {
+        // The community controller emits Ready=False (reason=SandboxSuspended)
+        // while the pod is still coming up.  This must not be treated as a
+        // terminal failure — Resuming stays Resuming until the supervisor connects.
+        let status = DriverSandboxStatus {
+            conditions: vec![
+                DriverCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "SandboxSuspended".to_string(),
+                    message: "Sandbox is suspended".to_string(),
+                    last_transition_time: String::new(),
+                },
+                DriverCondition {
+                    r#type: "Suspended".to_string(),
+                    status: "True".to_string(),
+                    reason: "PodTerminated".to_string(),
+                    message: "Pod was terminated".to_string(),
+                    last_transition_time: String::new(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            derive_phase_for_existing(SandboxPhase::Resuming, &status),
+            SandboxPhase::Resuming
+        );
+    }
+
+    #[test]
+    fn derive_phase_suspended_does_not_advance_to_ready_from_stale_conditions() {
+        // After resume, the K8s controller sets Ready=True while Suspended=True
+        // is still stale.  A sandbox in Suspended phase must NOT be promoted to
+        // Ready by this: Suspended exits only via ResumeSandbox → Resuming.
+        let status = DriverSandboxStatus {
+            conditions: vec![
+                DriverCondition {
+                    r#type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    reason: "DependenciesReady".to_string(),
+                    message: "Pod is ready".to_string(),
+                    last_transition_time: String::new(),
+                },
+                DriverCondition {
+                    r#type: "Suspended".to_string(),
+                    status: "True".to_string(),
+                    reason: "PodTerminated".to_string(),
+                    message: "stale".to_string(),
+                    last_transition_time: String::new(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            derive_phase_for_existing(SandboxPhase::Suspended, &status),
+            SandboxPhase::Suspended
+        );
+    }
+
+    #[test]
+    fn derive_phase_finished_condition_prevents_spurious_suspended() {
+        // After resume the pod runs and then exits normally.  The community
+        // controller sets Finished=True.  The stale Suspended=True from the
+        // earlier suspension is never cleared.  The phase at the time is
+        // Provisioning (supervisor disconnect → Ready→Provisioning).
+        // Without the Finished guard, suspended_condition && !pod_ready would
+        // route Provisioning → Suspended.  With the guard it returns Provisioning.
+        let status = DriverSandboxStatus {
+            conditions: vec![
+                DriverCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "PodNotReady".to_string(),
+                    message: "".to_string(),
+                    last_transition_time: String::new(),
+                },
+                DriverCondition {
+                    r#type: "Suspended".to_string(),
+                    status: "True".to_string(),
+                    reason: "PodTerminated".to_string(),
+                    message: "stale from prior suspension".to_string(),
+                    last_transition_time: String::new(),
+                },
+                DriverCondition {
+                    r#type: "Finished".to_string(),
+                    status: "True".to_string(),
+                    reason: "PodSucceeded".to_string(),
+                    message: "container exited normally".to_string(),
+                    last_transition_time: String::new(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            derive_phase_for_existing(SandboxPhase::Provisioning, &status),
+            SandboxPhase::Provisioning
+        );
+    }
+
+    #[test]
+    fn derive_phase_stale_suspended_without_finished_does_not_affect_provisioning() {
+        // Exact scenario from the v10 bug: after a resume the supervisor session
+        // ends with BrokenPipe (pod crashed or completed without Finished=True
+        // being set), causing Ready→Provisioning.  The K8s watch then fires with
+        // {Ready=False, Suspended=True} (stale from the prior suspension cycle,
+        // no Finished=True).  Before v11 this would route Provisioning→Suspended.
+        let status = DriverSandboxStatus {
+            conditions: vec![
+                DriverCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "PodNotReady".to_string(),
+                    message: "".to_string(),
+                    last_transition_time: String::new(),
+                },
+                DriverCondition {
+                    r#type: "Suspended".to_string(),
+                    status: "True".to_string(),
+                    reason: "PodTerminated".to_string(),
+                    message: "stale from prior suspension".to_string(),
+                    last_transition_time: String::new(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            derive_phase_for_existing(SandboxPhase::Provisioning, &status),
+            SandboxPhase::Provisioning
+        );
     }
 
     #[test]
@@ -2954,6 +3623,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_supervisor_session_connected_keeps_ready_sandbox_ready() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime.supervisor_session_connected("sb-1").await.unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+    }
+
+    #[tokio::test]
     async fn supervisor_session_disconnected_demotes_ready_sandbox() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
@@ -3044,6 +3733,7 @@ mod tests {
                     deleting: false,
                 }),
             }],
+            ..Default::default()
         }))
         .await;
 
@@ -3105,6 +3795,7 @@ mod tests {
                     last_transition_time: String::new(),
                 })),
             }],
+            ..Default::default()
         }))
         .await;
 
@@ -3392,6 +4083,72 @@ mod tests {
         assert_eq!(
             SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn suspend_sandbox_rolls_back_phase_when_driver_fails() {
+        let driver = Arc::new(
+            TestDriver::default().with_driver_name(ComputeDriverKind::Kubernetes.as_str()),
+        );
+        driver.set_stop_error(Some("kubernetes api unavailable".to_string()));
+        let runtime = test_kubernetes_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let err = runtime.suspend_sandbox("sandbox-a").await.unwrap_err();
+        assert_eq!(err.code(), Code::Unavailable);
+        assert!(err.message().contains("kubernetes api unavailable"));
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+
+        driver.set_stop_error(None);
+        let updated = runtime.suspend_sandbox("sandbox-a").await.unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(updated.phase()).unwrap(),
+            SandboxPhase::Suspending
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_sandbox_rolls_back_phase_when_driver_fails() {
+        let driver = Arc::new(
+            TestDriver::default().with_driver_name(ComputeDriverKind::Kubernetes.as_str()),
+        );
+        driver.set_resume_error(Some("kubernetes api unavailable".to_string()));
+        let runtime = test_kubernetes_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Suspended);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let err = runtime.resume_sandbox("sandbox-a").await.unwrap_err();
+        assert_eq!(err.code(), Code::Unavailable);
+        assert!(err.message().contains("kubernetes api unavailable"));
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Suspended
+        );
+
+        driver.set_resume_error(None);
+        let updated = runtime.resume_sandbox("sandbox-a").await.unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(updated.phase()).unwrap(),
+            SandboxPhase::Resuming
         );
     }
 
