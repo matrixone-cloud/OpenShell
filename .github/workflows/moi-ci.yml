@@ -1,0 +1,115 @@
+name: MOI CI
+
+on:
+  pull_request:
+    branches: [moi-dev]
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [moi-dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: moi-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "2"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  checks:
+    name: MOI / ${{ matrix.lane }}
+    if: github.repository == 'matrixone-cloud/OpenShell'
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.minutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: rust
+            minutes: 90
+          - lane: sdk
+            minutes: 45
+          - lane: repository
+            minutes: 30
+          - lane: helm
+            minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-moi-ci
+
+      - name: Configure Rust compiler cache
+        if: matrix.lane == 'rust'
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
+      - name: Cache Rust target and registry
+        if: matrix.lane == 'rust'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: moi-ci-linux-amd64
+          cache-on-failure: "true"
+
+      - name: Rust format, lint and unit tests
+        if: matrix.lane == 'rust'
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+        run: |
+          mise run rust:format:check
+          mise run rust:lint
+          mise run test:rust
+          mise run rust:verify:telemetry-off
+          mise run rust:verify:system-ca-roots
+
+      - name: Python, Go and TypeScript SDK checks
+        if: matrix.lane == 'sdk'
+        run: |
+          uv sync --frozen
+          mise run python:format:check
+          mise run python:lint
+          mise run python:typecheck
+          mise run test:python
+          mise run go:ci
+          mise run sdk:ts:ci
+
+      - name: Repository contracts and dependency policy
+        if: matrix.lane == 'repository'
+        run: |
+          mise lock
+          git diff --exit-code -- mise.lock
+          mise run license:check
+          mise run rust:deny:policy
+          mise run markdown:lint
+          mise run test:moi-ci
+
+      - name: Helm lint, generated documentation and unit tests
+        if: matrix.lane == 'helm'
+        run: |
+          mise run helm:lint
+          mise run helm:docs:check
+          mise run helm:test
+
+  result:
+    name: MOI / CI
+    needs: checks
+    if: ${{ always() && github.repository == 'matrixone-cloud/OpenShell' }}
+    runs-on: ubuntu-24.04
+    permissions: {}
+    env:
+      CHECKS_RESULT: ${{ needs.checks.result }}
+    steps:
+      - name: Require every lane to succeed
+        run: |
+          if [ "$CHECKS_RESULT" != success ]; then
+            echo "::error::MOI checks concluded $CHECKS_RESULT"
+            exit 1
+          fi

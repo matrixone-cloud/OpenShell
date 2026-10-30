@@ -230,6 +230,16 @@ the release tag.
 
 ## CI and E2E
 
+The MatrixOne internal fork uses `.github/workflows/moi-ci.yml` for PRs to
+`moi-dev`. Its GitHub-hosted Linux AMD64 lanes invoke the existing task owners
+directly, without a mirror branch, self-hosted runner or NVIDIA CI image.
+The read-only PR workflow aggregates real Rust, SDK, repository and Helm results
+under `MOI / CI`; GPU, other platforms and sandbox E2E are not part of that
+baseline. The legacy mirror-status publisher is disabled only in this fork.
+Branch protection settings remain a separate repository administration concern.
+
+The following describes the upstream NVIDIA CI model.
+
 Required checks run on GitHub Actions. Workflows that use NVIDIA self-hosted runners trigger from copy-pr-bot mirror branches, so trusted PRs are mirrored into `pull-request/<N>` branches before those workflows run. `main` also uses GitHub merge queue so the final queued integration commit is validated before it merges.
 
 The high-level CI model:

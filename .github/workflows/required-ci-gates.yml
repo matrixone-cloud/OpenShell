@@ -25,6 +25,8 @@ concurrency:
 jobs:
   publish:
     name: Publish required CI gate statuses
+    # This fork uses real pull_request checks in moi-ci.yml, without copy-pr-bot.
+    if: github.repository != 'matrixone-cloud/OpenShell'
     runs-on: ubuntu-latest
     steps:
       - name: Evaluate required CI gates

@@ -4,6 +4,36 @@ This document describes how OpenShell's continuous integration works for pull re
 
 For local test commands see [TESTING.md](TESTING.md). For PR conventions see [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## MatrixOne internal fork
+
+`matrixone-cloud/OpenShell` uses `MOI CI` for PRs targeting `moi-dev`, including
+PRs from forks. Opening or updating a PR starts the checks directly, without
+copy-pr-bot, a `pull-request/<N>` mirror, or an `/ok to test` comment. Pushes to
+`moi-dev` and manual dispatches also run the checks.
+
+Four GitHub-hosted Ubuntu AMD64 lanes run the existing Rust format, Clippy,
+unit-test and build-variant checks; Python, Go and TypeScript SDK checks;
+repository and dependency-policy checks; and Helm lint, documentation and unit
+tests. Tools come from `mise.lock`; the jobs install native build dependencies
+without pulling NVIDIA's CI image. PR jobs use read-only repository access,
+disable persisted checkout credentials and do not publish images or packages.
+
+`MOI / CI` succeeds only when every lane succeeds. Repository administrators can
+select this check in the `moi-dev` branch protection settings after the workflow
+is available. The old `Required CI Gates` publisher is disabled in this fork;
+its NVIDIA mirror statuses are not the internal required checks. This workflow
+does not change approval requirements or other branch protection settings.
+The upstream E2E-label helper is also disabled here so it does not post
+instructions to create a mirror that the internal workflow never consumes.
+
+GPU, macOS, ARM64 and sandbox E2E suites are outside this internal baseline.
+The upstream E2E labels do not enable them in `MOI CI`, and a green baseline
+does not claim those suites passed. Existing PRs must receive an update or be
+reopened after this workflow is merged to start their new PR checks. Old pending
+mirror statuses on previous commits are not rewritten as successful tests.
+
+The remaining sections describe NVIDIA's upstream workflow.
+
 ## Overview
 
 PR CI that runs on NVIDIA self-hosted runners uses NVIDIA's copy-pr-bot. The bot mirrors trusted PR commits to internal `pull-request/<N>` branches in this repository. The gated workflows trigger on pushes to those branches, not on the original PR.

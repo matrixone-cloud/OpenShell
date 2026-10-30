@@ -1,0 +1,27 @@
+name: Set up MOI CI
+description: Install the locked OpenShell toolchain on a GitHub-hosted Ubuntu runner.
+
+runs:
+  using: composite
+  steps:
+    - name: Install native build dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential clang libclang-dev libz3-dev pkg-config libssl-dev \
+          musl-tools cmake socat unzip xz-utils jq rsync zstd
+
+    - name: Install mise
+      shell: bash
+      run: |
+        curl --proto '=https' --tlsv1.2 -fsSL https://mise.run | MISE_VERSION=v2026.4.25 sh
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
+
+    - name: Install locked tools
+      shell: bash
+      run: |
+        mise trust
+        mise install --locked
+        rustup component add clippy rustfmt

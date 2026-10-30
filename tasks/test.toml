@@ -14,7 +14,12 @@ depends = [
   "test:build-env",
   "test:packaging-assets",
   "test:docs-website",
+  "test:moi-ci",
 ]
+
+["test:moi-ci"]
+description = "Test the internal GitHub-hosted CI workflow contract"
+run = "uv run --no-project --with pytest --with pyyaml pytest tasks/scripts/moi_ci_test.py"
 
 ["test:docs-website"]
 description = "Test the docs-website sync script"
