@@ -649,6 +649,9 @@ impl ProcessHandle {
             cmd.env("HOME", home);
         }
 
+        if matches!(policy.network.mode, NetworkMode::Allow) {
+            child_env::clear_proxy_env(cmd.as_std_mut());
+        }
         if matches!(policy.network.mode, NetworkMode::Proxy) {
             let proxy = policy.network.proxy.as_ref().ok_or_else(|| {
                 miette::miette!(
@@ -804,6 +807,9 @@ impl ProcessHandle {
             cmd.env("HOME", home);
         }
 
+        if matches!(policy.network.mode, NetworkMode::Allow) {
+            child_env::clear_proxy_env(cmd.as_std_mut());
+        }
         if matches!(policy.network.mode, NetworkMode::Proxy) {
             let proxy = policy.network.proxy.as_ref().ok_or_else(|| {
                 miette::miette!(

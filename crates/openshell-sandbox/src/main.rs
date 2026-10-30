@@ -187,6 +187,11 @@ struct Args {
     #[arg(long, default_value = DEFAULT_MODE)]
     mode: Mode,
 
+    /// Allow direct TCP/UDP egress without the `OpenShell` proxy or network fence.
+    /// This argument is supplied by the runtime driver, never by workload env.
+    #[arg(long)]
+    unrestricted_network: bool,
+
     /// UID that the long-running Kubernetes network sidecar will run as.
     /// `--mode=network-init` installs nftables rules that exempt this UID.
     #[arg(long, env = "OPENSHELL_PROXY_UID", default_value_t = 1337)]
@@ -440,6 +445,7 @@ fn run_network_init(
     proxy_primary_group_id: u32,
     sidecar_state_dir: &str,
     sidecar_tls_dir: &str,
+    unrestricted_network: bool,
 ) -> Result<()> {
     validate_network_init_ids(proxy_user_id, proxy_primary_group_id)?;
 
@@ -467,7 +473,11 @@ fn run_network_init(
         proxy_primary_group_id,
         SIDECAR_TLS_DIR_MODE,
     )?;
-    openshell_supervisor_process::netns::install_sidecar_bypass_rules(proxy_user_id)
+    if unrestricted_network {
+        Ok(())
+    } else {
+        openshell_supervisor_process::netns::install_sidecar_bypass_rules(proxy_user_id)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -493,6 +503,7 @@ fn run_network_init(
     _proxy_gid: u32,
     _sidecar_state_dir: &str,
     _sidecar_tls_dir: &str,
+    _unrestricted_network: bool,
 ) -> Result<()> {
     Err(miette::miette!(
         "--mode=network-init is only supported on Linux"
@@ -537,6 +548,7 @@ fn main() -> Result<()> {
             proxy_gid,
             &args.sidecar_state_dir,
             &args.sidecar_tls_dir,
+            args.unrestricted_network,
         );
     }
 
@@ -683,6 +695,7 @@ fn main() -> Result<()> {
             ocsf_enabled,
             args.mode.network,
             args.mode.process,
+            args.unrestricted_network,
             upstream_proxy_args,
         )
         .await
@@ -695,6 +708,14 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn unrestricted_network_requires_an_explicit_argument() {
+        let restricted = Args::try_parse_from(["openshell-sandbox"]).unwrap();
+        assert!(!restricted.unrestricted_network);
+        let direct = Args::try_parse_from(["openshell-sandbox", "--unrestricted-network"]).unwrap();
+        assert!(direct.unrestricted_network);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

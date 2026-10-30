@@ -493,6 +493,27 @@ kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-supervisor-networ
 kubectl -n <sandbox-namespace> logs <sandbox-pod> -c agent --tail=200
 ```
 
+#### Per-sandbox unrestricted networking
+
+Kubernetes admits `spec.template.driver_config.kubernetes.unrestricted_network = true`
+only when the operator enables `supervisor.allowUnrestrictedNetwork` in Helm
+(`allow_unrestricted_network` in the Kubernetes driver configuration). The
+operator setting defaults to false and does not change other sandboxes. A denied
+request must fail before creating Kubernetes resources.
+
+Confirm the stored driver configuration and that every supervisor leaf receives
+`--unrestricted-network`, including `openshell-network-init` in sidecar topology.
+Use gateway and supervisor images from the same source revision. The init leaf
+still prepares authenticated sidecar state but skips nftables enforcement. The
+workload keeps its filesystem, process, identity, and Kubernetes isolation.
+
+This mode permits ordinary IPv4/IPv6 TCP and UDP traffic, including private
+addresses; CNI policies and external firewalls still apply. It bypasses OpenShell
+allowlists, request middleware, provider credential injection, and inference
+routing. Inherited HTTP/SOCKS/gRPC proxy routing variables are removed from
+workload and SSH children. The mode is fixed at creation; changing allowlist
+policy cannot change it. Recreate a sandbox to choose a different mode.
+
 #### Corporate upstream proxy
 
 When the deployment routes sandbox egress through a corporate HTTP forward

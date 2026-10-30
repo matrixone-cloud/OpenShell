@@ -319,6 +319,9 @@ pub struct KubernetesComputeConfig {
     pub supervisor_sideload_method: SupervisorSideloadMethod,
     /// How the supervisor is arranged for Kubernetes sandbox pods.
     pub topology: SupervisorTopology,
+    /// Admit per-sandbox `driver_config.unrestricted_network` requests.
+    /// Existing and omitted requests retain proxy-enforced networking.
+    pub allow_unrestricted_network: bool,
     /// Sidecar-only settings used when `topology = "sidecar"`.
     pub sidecar: KubernetesSidecarConfig,
     /// Corporate HTTP forward proxy used by the network supervisor for
@@ -444,6 +447,7 @@ impl Default for KubernetesComputeConfig {
             supervisor_image: config::default_supervisor_image(),
             supervisor_image_pull_policy: String::new(),
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
+            allow_unrestricted_network: false,
             topology: SupervisorTopology::default(),
             sidecar: KubernetesSidecarConfig::default(),
             https_proxy: None,

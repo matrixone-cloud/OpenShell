@@ -3776,6 +3776,7 @@ version = "0.0.0"
 dependencies = [
  "clap",
  "futures",
+ "http 1.4.0",
  "k8s-openapi",
  "kube",
  "kube-runtime",
@@ -3793,6 +3794,7 @@ dependencies = [
  "tokio-stream",
  "toml",
  "tonic",
+ "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
 ]

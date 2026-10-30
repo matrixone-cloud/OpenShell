@@ -358,6 +358,7 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `supervisor_image_pull_policy` | `supervisor.image.pullPolicy` | Set the Kubernetes image pull policy for the supervisor image. |
 | `supervisor_sideload_method` | `supervisor.sideloadMethod` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect from cluster version. Set to `image-volume` to mount the supervisor OCI image directly as a volume (requires Kubernetes 1.33+ with the ImageVolume feature gate; GA in 1.36), or `init-container` to copy it through an init container on older clusters. |
 | `topology` | `supervisor.topology` | Set `combined` for the default single supervisor path, or `sidecar` to move pod-level network enforcement and the gateway session into a dedicated sidecar. |
+| `allow_unrestricted_network` | `supervisor.allowUnrestrictedNetwork` | Allow explicitly requested unrestricted networking for new Kubernetes sandboxes. Defaults to `false`; other sandboxes retain allowlist enforcement. |
 | `https_proxy` | `upstreamProxy.url` | Set the operator-owned `http://host:port` corporate forward proxy used for policy-approved TLS CONNECT egress. |
 | `no_proxy` | `upstreamProxy.noProxy` | Set destinations that bypass only the corporate proxy. OpenShell policy evaluation still applies. |
 | `proxy_auth_secret_name` | `upstreamProxy.authSecret.name` | Set the existing Secret name in the sandbox namespace that contains the proxy credential. Requires `sidecar` topology. |
@@ -415,6 +416,60 @@ If Agent Sandbox is upgraded in place, restart the OpenShell gateway after the c
 <Note>
 `Sandbox.spec.volumeClaimTemplates` is immutable after creation. To change storage configuration, delete the sandbox and create a new one with the updated spec.
 </Note>
+
+### Unrestricted Kubernetes Networking
+
+Enable `allow_unrestricted_network = true` in the Kubernetes gateway driver
+configuration before creating an unrestricted sandbox. For Helm, set
+`supervisor.allowUnrestrictedNetwork = true`. The default is false, and the
+driver rejects an unapproved request with `INVALID_ARGUMENT` during creation
+preflight, before the gateway persists the sandbox or creates Kubernetes
+resources. The create path also checks admission before any Kubernetes writes.
+Use gateway and supervisor images built from the same source revision.
+
+Select unrestricted networking for one sandbox through its driver config.
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{"kubernetes":{"unrestricted_network":true}}' \
+  -- claude
+```
+
+Omitting the field or setting it to false preserves the normal proxy and
+allowlist path, even when the operator permits unrestricted creation. Both modes
+can coexist. The selection is fixed at creation, persists through stop/start,
+and is independent of policy reloads. Recreate a sandbox to change the mode.
+Turning the operator setting off blocks new requests without changing existing
+sandboxes.
+
+Unrestricted sandboxes permit ordinary IPv4 and IPv6 TCP/UDP egress, including
+private destinations. OpenShell skips the network namespace proxy fence and
+sidecar nftables setup for these sandboxes. Kubernetes network isolation,
+filesystem policy, process identity, and child syscall restrictions remain in
+place. CNI policy, routing, and external firewalls still determine reachability.
+The mode does not enable host networking or raw sockets.
+
+This mode bypasses OpenShell endpoint/L7 allowlists, HTTP middleware, proxy
+credential injection, `inference.local`, and corporate proxy settings. The
+driver omits corporate proxy arguments and credential mounts. Workload and SSH
+children do not inherit HTTP, HTTPS, SOCKS, or gRPC proxy routing variables.
+
+The driver supplies `--unrestricted-network` to each supervisor leaf, including
+the sidecar network init container. Workload environment variables cannot enable
+it. The sidecar still prepares its shared state and authenticated control
+channel, and gateway authentication and SSH continue to use their existing paths.
+Before rolling back to an older supervisor, recreate unrestricted sandboxes or
+retain a supervisor that understands this argument.
+
+For a dedicated local Kind or disposable CI cluster, the existing Kubernetes
+E2E harness provides `mise run e2e:kubernetes:unrestricted` and
+`mise run e2e:kubernetes:unrestricted:sidecar`. Set
+`OPENSHELL_E2E_KUBE_CONTEXT` to that cluster and
+`OPENSHELL_E2E_NETWORK_NAME` to its Docker network. Supply matching local
+images through the harness's existing `OPENSHELL_REGISTRY` and `IMAGE_TAG`
+inputs. These opt-in profiles test TCP/UDP and DNS, proxy environment cleanup,
+non-root identity, raw-socket denial, and separate modes for entrypoint and SSH
+children while both sandboxes exist.
 
 ### Kubernetes Driver Config PVC Mounts
 

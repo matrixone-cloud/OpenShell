@@ -113,6 +113,22 @@ tests:
           path: data["gateway.toml"]
           pattern: 'supervisor[_]topology\s*='
 
+  - it: omits the opt-in key by default for compatibility with older gateways
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'allow_unrestricted_network\s*='
+
+  - it: allows operators to admit explicitly unrestricted sandboxes
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.allowUnrestrictedNetwork: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'allow_unrestricted_network\s*=\s*true'
+
   - it: renders operator-owned upstream proxy settings under the Kubernetes driver
     template: templates/gateway-config.yaml
     set:

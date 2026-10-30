@@ -135,6 +135,7 @@ struct AgentSandboxApi {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct KubernetesSandboxDriverConfig {
+    unrestricted_network: bool,
     pod: KubernetesPodDriverConfig,
     containers: KubernetesDriverContainersConfig,
     volumes: Vec<KubernetesDriverVolumeConfig>,
@@ -170,6 +171,15 @@ impl KubernetesSandboxDriverConfig {
                 Path::new(WORKSPACE_MOUNT_PATH),
             )
         })
+    }
+
+    fn validate_network_admission(&self, allowed: bool) -> Result<(), String> {
+        if self.unrestricted_network && !allowed {
+            return Err(
+                "unrestricted network is disabled by the Kubernetes runtime operator".into(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1194,8 +1204,11 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), tonic::Status> {
-        let _ = self
+        let driver_config = self
             .validate_driver_config_for_sandbox(sandbox)
+            .map_err(tonic::Status::invalid_argument)?;
+        driver_config
+            .validate_network_admission(self.config.allow_unrestricted_network)
             .map_err(tonic::Status::invalid_argument)?;
         match self.config.workspace_mode {
             WorkspaceMode::Shared => {
@@ -1339,6 +1352,20 @@ impl KubernetesComputeDriver {
 
     #[allow(clippy::similar_names)]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
+        // Reject before namespace, Secret or workload creation. The choice is
+        // durable in the existing driver-config Struct and does not come from
+        // mutable workload environment variables or caller labels.
+        let requested_config = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref())
+            .map(KubernetesSandboxDriverConfig::from_template)
+            .transpose()
+            .map_err(KubernetesDriverError::InvalidArgument)?
+            .unwrap_or_default();
+        requested_config
+            .validate_network_admission(self.config.allow_unrestricted_network)
+            .map_err(KubernetesDriverError::InvalidArgument)?;
         let gpu_requirements = sandbox
             .spec
             .as_ref()
@@ -1405,6 +1432,8 @@ impl KubernetesComputeDriver {
             supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
             supervisor_sideload_method: self.config.supervisor_sideload_method,
             topology: self.config.topology,
+            allow_unrestricted_network: self.config.allow_unrestricted_network,
+            unrestricted_network: requested_config.unrestricted_network,
             proxy_uid: self.config.sidecar.proxy_uid,
             process_binary_aware_network_policy: self
                 .config
@@ -2528,7 +2557,9 @@ fn apply_supervisor_sideload_with_params(
             driver_mounts::DEFAULT_WORKSPACE_ROOT.to_string(),
         ];
         command.extend(upstream_proxy_cli_args(params));
-        container.insert("command".to_string(), serde_json::json!(command));
+        let mut command = serde_json::json!(command);
+        apply_unrestricted_network_argument(&mut command, params);
+        container.insert("command".to_string(), command);
 
         // Force the supervisor to run as root (UID 0). Sandbox images may set
         // a non-root USER directive (e.g. `USER sandbox`), but the supervisor
@@ -2595,6 +2626,9 @@ fn apply_supervisor_sideload(
 }
 
 fn upstream_proxy_cli_args(params: &SandboxPodParams<'_>) -> Vec<String> {
+    if params.unrestricted_network {
+        return Vec::new();
+    }
     let mut args = Vec::new();
     if let Some(url) = params.https_proxy {
         args.extend(["--upstream-proxy".to_string(), url.to_string()]);
@@ -2640,7 +2674,9 @@ fn upstream_proxy_auth_file_name() -> &'static str {
 }
 
 fn has_upstream_proxy_credentials(params: &SandboxPodParams<'_>) -> bool {
-    params.proxy_auth_secret_name.is_some() && params.proxy_auth_secret_key.is_some()
+    !params.unrestricted_network
+        && params.proxy_auth_secret_name.is_some()
+        && params.proxy_auth_secret_key.is_some()
 }
 
 fn sidecar_state_volume_mount() -> serde_json::Value {
@@ -2780,6 +2816,7 @@ fn supervisor_sidecar_container(
             }
         ]
     });
+    apply_unrestricted_network_argument(&mut container["command"], params);
     container["command"]
         .as_array_mut()
         .expect("network supervisor command is an array")
@@ -2851,6 +2888,7 @@ fn supervisor_network_init_container(params: &SandboxPodParams<'_>) -> serde_jso
             sidecar_tls_volume_mount(),
         ]
     });
+    apply_unrestricted_network_argument(&mut container["command"], params);
     if !params.supervisor_image_pull_policy.is_empty() {
         container["imagePullPolicy"] = serde_json::json!(params.supervisor_image_pull_policy);
     }
@@ -2940,6 +2978,10 @@ fn apply_supervisor_sidecar_topology(
                 "--workdir",
                 driver_mounts::DEFAULT_WORKSPACE_ROOT
             ]),
+        );
+        apply_unrestricted_network_argument(
+            container.get_mut("command").expect("supervisor command"),
+            params,
         );
 
         let security_context = container
@@ -3206,7 +3248,20 @@ fn default_workspace_volume_claim_templates(
     }])
 }
 
+fn apply_unrestricted_network_argument(
+    command: &mut serde_json::Value,
+    params: &SandboxPodParams<'_>,
+) {
+    if params.unrestricted_network {
+        command
+            .as_array_mut()
+            .expect("supervisor command is an array")
+            .push(serde_json::json!("--unrestricted-network"));
+    }
+}
+
 /// Parameters shared by `sandbox_to_k8s_spec` and `sandbox_template_to_k8s`.
+#[derive(Clone)]
 #[allow(clippy::struct_excessive_bools)]
 struct SandboxPodParams<'a> {
     default_image: &'a str,
@@ -3216,6 +3271,8 @@ struct SandboxPodParams<'a> {
     supervisor_image_pull_policy: &'a str,
     supervisor_sideload_method: SupervisorSideloadMethod,
     topology: SupervisorTopology,
+    allow_unrestricted_network: bool,
+    unrestricted_network: bool,
     proxy_uid: u32,
     process_binary_aware_network_policy: bool,
     https_proxy: Option<&'a str>,
@@ -3257,6 +3314,8 @@ impl Default for SandboxPodParams<'_> {
             supervisor_image_pull_policy: "",
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
             topology: SupervisorTopology::default(),
+            allow_unrestricted_network: false,
+            unrestricted_network: false,
             proxy_uid: DEFAULT_PROXY_UID,
             process_binary_aware_network_policy: true,
             https_proxy: None,
@@ -3337,6 +3396,12 @@ fn sandbox_to_k8s_spec(
 ) -> Result<serde_json::Value, String> {
     let driver_config =
         kubernetes_driver_config_for_spec(spec, provider_spiffe_socket_path(params))?;
+    driver_config.validate_network_admission(params.allow_unrestricted_network)?;
+    let effective_params = SandboxPodParams {
+        unrestricted_network: driver_config.unrestricted_network,
+        ..params.clone()
+    };
+    let params = &effective_params;
     let mut root = serde_json::Map::new();
 
     // Determine early whether OpenShell should inject its default workspace
@@ -4725,6 +4790,178 @@ mod tests {
             .find(|item| item.get("name").and_then(|value| value.as_str()) == Some(name))?
             .get("value")?
             .as_str()
+    }
+
+    fn direct_network_spec(unrestricted: bool) -> SandboxSpec {
+        SandboxSpec {
+            template: Some(SandboxTemplate {
+                image: "example.test/sandbox:fixture".into(),
+                driver_config: Some(json_struct(serde_json::json!({
+                    "unrestricted_network": unrestricted
+                }))),
+                ..SandboxTemplate::default()
+            }),
+            ..SandboxSpec::default()
+        }
+    }
+
+    fn network_admission_driver(
+        allowed: bool,
+        workspace_mode: WorkspaceMode,
+    ) -> KubernetesComputeDriver {
+        let service = tower::service_fn(|_: http::Request<kube::client::Body>| async {
+            Err::<http::Response<kube::client::Body>, _>(std::io::Error::other(
+                "network admission must not call the Kubernetes API",
+            ))
+        });
+        let client = Client::new(service, "default");
+        KubernetesComputeDriver {
+            client: client.clone(),
+            watch_client: client,
+            sandbox_api_version: Arc::new(OnceCell::new()),
+            config: KubernetesComputeConfig {
+                allow_unrestricted_network: allowed,
+                workspace_mode,
+                ..KubernetesComputeConfig::default()
+            },
+            operator_allowlist: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_sandbox_create_enforces_network_admission() {
+        for workspace_mode in [
+            WorkspaceMode::Shared,
+            WorkspaceMode::Managed,
+            WorkspaceMode::Operator,
+        ] {
+            for allowed in [false, true] {
+                let driver = network_admission_driver(allowed, workspace_mode);
+                for requested in [None, Some(false), Some(true)] {
+                    let mut spec = direct_network_spec(requested.unwrap_or(false));
+                    if requested.is_none() {
+                        spec.template.as_mut().unwrap().driver_config = None;
+                    }
+                    let sandbox = Sandbox {
+                        name: "network-admission".into(),
+                        workspace: "default".into(),
+                        spec: Some(spec),
+                        ..Sandbox::default()
+                    };
+                    let result = driver.validate_sandbox_create(&sandbox).await;
+                    if requested == Some(true) && !allowed {
+                        let error =
+                            result.expect_err("unapproved network mode must fail preflight");
+                        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+                        assert!(error.message().contains("unrestricted network is disabled"));
+                    } else {
+                        result.expect("admitted and allowlist modes must pass preflight");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_keeps_network_admission_guard() {
+        let driver = network_admission_driver(false, WorkspaceMode::Shared);
+        let sandbox = Sandbox {
+            name: "network-admission".into(),
+            workspace: "default".into(),
+            spec: Some(direct_network_spec(true)),
+            ..Sandbox::default()
+        };
+        let error = driver.create_sandbox(&sandbox).await.unwrap_err();
+        assert!(matches!(error, KubernetesDriverError::InvalidArgument(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("unrestricted network is disabled")
+        );
+    }
+
+    #[test]
+    fn unrestricted_network_is_rejected_unless_operator_enables_it() {
+        let error = sandbox_to_k8s_spec(
+            Some(&direct_network_spec(true)),
+            &SandboxPodParams::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("unrestricted network is disabled"));
+        let config = KubernetesSandboxDriverConfig::from_template(
+            direct_network_spec(true).template.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert!(config.validate_network_admission(false).is_err());
+    }
+
+    #[test]
+    fn unrestricted_network_is_consistent_across_sidecar_leaves() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::Sidecar,
+            allow_unrestricted_network: true,
+            ..SandboxPodParams::default()
+        };
+        let rendered = sandbox_to_k8s_spec(Some(&direct_network_spec(true)), &params).unwrap();
+        let pod = &rendered["spec"]["podTemplate"]["spec"];
+        for name in [
+            "agent",
+            SUPERVISOR_NETWORK_SIDECAR_NAME,
+            SUPERVISOR_NETWORK_INIT_CONTAINER_NAME,
+        ] {
+            let container = pod["containers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(pod["initContainers"].as_array().into_iter().flatten())
+                .find(|value| value["name"] == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert!(
+                container["command"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("--unrestricted-network")),
+                "{name}"
+            );
+        }
+        // The network sidecar remains present for the authenticated control path.
+        let process = &pod["containers"][0];
+        assert_eq!(
+            rendered_env(
+                process,
+                openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE
+            ),
+            Some("sidecar-nftables")
+        );
+    }
+
+    #[test]
+    fn unrestricted_network_does_not_require_corporate_proxy_credentials() {
+        let params = SandboxPodParams {
+            allow_unrestricted_network: true,
+            https_proxy: Some("http://proxy.example.com:8080"),
+            proxy_auth_secret_name: Some("corporate-proxy-auth"),
+            proxy_auth_secret_key: Some("credentials"),
+            ..SandboxPodParams::default()
+        };
+        let result = sandbox_to_k8s_spec(Some(&direct_network_spec(true)), &params).unwrap();
+        let rendered = serde_json::to_string(&result).unwrap();
+        assert!(!rendered.contains("--upstream-proxy"));
+        assert!(!rendered.contains("corporate-proxy-auth"));
+        assert!(rendered.contains("--unrestricted-network"));
+    }
+
+    #[test]
+    fn operator_permission_does_not_change_limited_sandboxes() {
+        let params = SandboxPodParams {
+            allow_unrestricted_network: true,
+            ..SandboxPodParams::default()
+        };
+        let rendered = sandbox_to_k8s_spec(Some(&direct_network_spec(false)), &params).unwrap();
+        let command = rendered["spec"]["podTemplate"]["spec"]["containers"][0]["command"]
+            .as_array()
+            .unwrap();
+        assert!(!command.contains(&serde_json::json!("--unrestricted-network")));
     }
 
     #[test]

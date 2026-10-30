@@ -467,6 +467,9 @@ supervisor_sideload_method     = "image-volume"
 # filesystem, and network enforcement in the agent container. "sidecar" moves
 # pod-level network enforcement and gateway session handling into a network sidecar.
 topology                       = "combined"
+# Admit per-sandbox unrestricted_network requests. Existing and omitted-mode
+# sandboxes retain proxy enforcement. Defaults to false.
+allow_unrestricted_network     = false
 # Optional corporate HTTP forward proxy for policy-approved TLS egress. The
 # sandbox workload cannot select or override these settings. Only http:// proxy
 # endpoints and TLS CONNECT traffic are supported; plain HTTP egress remains
@@ -550,6 +553,20 @@ In managed workspace mode, the Kubernetes driver copies each explicitly named
 `image_pull_secrets` Secret from `namespace` into the managed workspace
 namespace on sandbox creation. Shared and operator modes require the Secret to
 already exist in the sandbox namespace.
+
+`allow_unrestricted_network` controls Kubernetes creation admission only. Set it
+to `true` to accept an explicit `unrestricted_network = true` request in the
+sandbox's Kubernetes driver config. The Helm value is
+`supervisor.allowUnrestrictedNetwork`. Other sandboxes keep their allowlist.
+Helm omits this key while disabled so the default chart configuration remains
+readable by older gateways that reject unknown driver fields.
+The mode is fixed at creation and survives stop/start and gateway restarts;
+turning admission off does not revoke existing unrestricted sandboxes.
+
+Use gateway and supervisor images from the same source revision. An older
+supervisor rejects the new argument, so retain the compatible supervisor when
+rolling back admission. See [Unrestricted Kubernetes Networking](./sandbox-compute-drivers#unrestricted-kubernetes-networking)
+for creation and enforcement boundaries.
 
 ### Docker
 

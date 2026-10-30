@@ -788,6 +788,9 @@ fn apply_child_env(
         }
         cmd.env(key, value);
     }
+    if proxy_url.is_none() {
+        child_env::clear_proxy_env(cmd);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1368,6 +1371,38 @@ fn is_loopback_host(host: &str) -> bool {
 mod tests {
     use super::*;
     use std::process::Stdio;
+
+    #[test]
+    fn direct_ssh_sessions_remove_image_and_provider_proxy_routing() {
+        let mut command = Command::new("/usr/bin/env");
+        let user_environment = HashMap::from([
+            (
+                "HTTP_PROXY".to_string(),
+                "http://image-proxy:3128".to_string(),
+            ),
+            ("KEEP_ME".to_string(), "present".to_string()),
+        ]);
+        let provider_environment = HashMap::from([(
+            "all_proxy".to_string(),
+            "socks5://provider-proxy:1080".to_string(),
+        )]);
+        apply_child_env(
+            &mut command,
+            "/sandbox",
+            "sandbox",
+            "xterm",
+            None,
+            None,
+            &provider_environment,
+            &user_environment,
+        );
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        let environment = String::from_utf8(output.stdout).unwrap();
+        assert!(environment.lines().any(|line| line == "KEEP_ME=present"));
+        assert!(!environment.contains("HTTP_PROXY="));
+        assert!(!environment.contains("all_proxy="));
+    }
 
     /// Regression test: the direct-tcpip connect path sets `TCP_NODELAY`.
     #[tokio::test]

@@ -103,6 +103,7 @@ pub async fn run_sandbox(
     ocsf_enabled: Arc<AtomicBool>,
     network_enabled: bool,
     process_enabled: bool,
+    unrestricted_network: bool,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
 ) -> Result<i32> {
     let (program, args) = command
@@ -194,6 +195,16 @@ pub async fn run_sandbox(
         )
         .await?
     };
+
+    // The driver freezes this per-sandbox choice in argv for every leaf. Keep
+    // policy loading, identity and the sidecar control channel intact; only
+    // network interception is disabled. Policy reloads cannot change argv.
+    if unrestricted_network {
+        policy.network = NetworkPolicy {
+            mode: NetworkMode::Allow,
+            proxy: None,
+        };
+    }
 
     // Normalize the active driver's identity contract once, while both the
     // policy and launched image filesystem are available. Kubernetes and
@@ -440,7 +451,7 @@ pub async fn run_sandbox(
 
     #[cfg(target_os = "linux")]
     let sidecar_control_server = if network_enabled && sidecar_network_enforcement {
-        if !matches!(policy.network.mode, NetworkMode::Proxy) {
+        if !matches!(policy.network.mode, NetworkMode::Proxy | NetworkMode::Allow) {
             return Err(miette::miette!(
                 "sidecar network enforcement requires proxy network mode"
             ));

@@ -21,6 +21,14 @@ pub fn proxy_env_vars(proxy_url: &str) -> [(&'static str, String); 9] {
     ]
 }
 
+/// Direct networking must not inherit the supervisor's forced proxy routing.
+pub fn clear_proxy_env(cmd: &mut std::process::Command) {
+    for (key, _) in proxy_env_vars("") {
+        cmd.env_remove(key);
+    }
+    cmd.env_remove("all_proxy").env_remove("GRPC_PROXY");
+}
+
 pub fn tls_env_vars(
     ca_cert_path: &Path,
     combined_bundle_path: &Path,
@@ -63,6 +71,23 @@ mod tests {
         assert!(stdout.contains("NO_PROXY=127.0.0.1,localhost,::1"));
         assert!(stdout.contains("NODE_USE_ENV_PROXY=1"));
         assert!(stdout.contains("no_proxy=127.0.0.1,localhost,::1"));
+    }
+
+    #[test]
+    fn direct_networking_removes_inherited_proxy_routing() {
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.env_clear().env("KEEP_ME", "present");
+        for (key, value) in proxy_env_vars("http://127.0.0.1:3128") {
+            cmd.env(key, value);
+        }
+        cmd.env("all_proxy", "http://127.0.0.1:3128");
+        clear_proxy_env(&mut cmd);
+        let output = cmd.output().expect("spawn direct child");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "KEEP_ME=present\n"
+        );
     }
 
     #[test]

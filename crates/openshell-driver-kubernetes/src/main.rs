@@ -116,6 +116,10 @@ struct Args {
     #[arg(long, env = "OPENSHELL_K8S_TOPOLOGY", default_value = "combined")]
     topology: SupervisorTopology,
 
+    /// Allow explicit per-sandbox direct networking requests.
+    #[arg(long, default_value_t = false)]
+    allow_unrestricted_network: bool,
+
     #[arg(
         long = "sidecar-proxy-uid",
         alias = "proxy-uid",
@@ -247,6 +251,7 @@ async fn main() -> Result<()> {
             supervisor_image_pull_policy: args.supervisor_image_pull_policy.unwrap_or_default(),
             supervisor_sideload_method: args.supervisor_sideload_method,
             topology: args.topology,
+            allow_unrestricted_network: args.allow_unrestricted_network,
             sidecar: KubernetesSidecarConfig {
                 proxy_uid: args.sidecar_proxy_uid,
                 process_binary_aware_network_policy: args

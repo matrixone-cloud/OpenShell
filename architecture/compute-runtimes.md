@@ -29,6 +29,11 @@ drive client provisioning UI, the driver attaches the shared
 clients to parse Kubernetes reasons, VM cache states, or other driver-local
 reason strings.
 
+The gateway runs driver creation validation before persisting a new sandbox.
+The Kubernetes driver checks unrestricted-network admission in that preflight
+and returns `INVALID_ARGUMENT` when the operator has not enabled it. It repeats
+the admission check in the create path before writing Kubernetes resources.
+
 ## Sandbox Readiness Composition
 
 The gateway composes driver backend state with supervisor session presence to
