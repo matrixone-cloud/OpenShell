@@ -35,6 +35,8 @@ const (
 	OpenShell_DeleteSandbox_FullMethodName                 = "/openshell.v1.OpenShell/DeleteSandbox"
 	OpenShell_StopSandbox_FullMethodName                   = "/openshell.v1.OpenShell/StopSandbox"
 	OpenShell_StartSandbox_FullMethodName                  = "/openshell.v1.OpenShell/StartSandbox"
+	OpenShell_PrepareSandboxStart_FullMethodName           = "/openshell.v1.OpenShell/PrepareSandboxStart"
+	OpenShell_SetManagedSandboxRunning_FullMethodName      = "/openshell.v1.OpenShell/SetManagedSandboxRunning"
 	OpenShell_CreateSshSession_FullMethodName              = "/openshell.v1.OpenShell/CreateSshSession"
 	OpenShell_ExposeService_FullMethodName                 = "/openshell.v1.OpenShell/ExposeService"
 	OpenShell_GetService_FullMethodName                    = "/openshell.v1.OpenShell/GetService"
@@ -128,6 +130,10 @@ type OpenShellClient interface {
 	StopSandbox(ctx context.Context, in *StopSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
 	// Start a previously stopped sandbox.
 	StartSandbox(ctx context.Context, in *StartSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
+	// Install credentials for a managed runner while its compute is stopped.
+	PrepareSandboxStart(ctx context.Context, in *PrepareSandboxStartRequest, opts ...grpc.CallOption) (*PrepareSandboxStartResponse, error)
+	// Stop or start a managed runner using credential-aware lifecycle semantics.
+	SetManagedSandboxRunning(ctx context.Context, in *SetManagedSandboxRunningRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
 	// Create a short-lived SSH session for a sandbox.
 	CreateSshSession(ctx context.Context, in *CreateSshSessionRequest, opts ...grpc.CallOption) (*CreateSshSessionResponse, error)
 	// Create or update a sandbox HTTP service endpoint for local routing.
@@ -399,6 +405,26 @@ func (c *openShellClient) StartSandbox(ctx context.Context, in *StartSandboxRequ
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SandboxResponse)
 	err := c.cc.Invoke(ctx, OpenShell_StartSandbox_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) PrepareSandboxStart(ctx context.Context, in *PrepareSandboxStartRequest, opts ...grpc.CallOption) (*PrepareSandboxStartResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PrepareSandboxStartResponse)
+	err := c.cc.Invoke(ctx, OpenShell_PrepareSandboxStart_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) SetManagedSandboxRunning(ctx context.Context, in *SetManagedSandboxRunningRequest, opts ...grpc.CallOption) (*SandboxResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SandboxResponse)
+	err := c.cc.Invoke(ctx, OpenShell_SetManagedSandboxRunning_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1015,6 +1041,10 @@ type OpenShellServer interface {
 	StopSandbox(context.Context, *StopSandboxRequest) (*SandboxResponse, error)
 	// Start a previously stopped sandbox.
 	StartSandbox(context.Context, *StartSandboxRequest) (*SandboxResponse, error)
+	// Install credentials for a managed runner while its compute is stopped.
+	PrepareSandboxStart(context.Context, *PrepareSandboxStartRequest) (*PrepareSandboxStartResponse, error)
+	// Stop or start a managed runner using credential-aware lifecycle semantics.
+	SetManagedSandboxRunning(context.Context, *SetManagedSandboxRunningRequest) (*SandboxResponse, error)
 	// Create a short-lived SSH session for a sandbox.
 	CreateSshSession(context.Context, *CreateSshSessionRequest) (*CreateSshSessionResponse, error)
 	// Create or update a sandbox HTTP service endpoint for local routing.
@@ -1207,6 +1237,12 @@ func (UnimplementedOpenShellServer) StopSandbox(context.Context, *StopSandboxReq
 }
 func (UnimplementedOpenShellServer) StartSandbox(context.Context, *StartSandboxRequest) (*SandboxResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method StartSandbox not implemented")
+}
+func (UnimplementedOpenShellServer) PrepareSandboxStart(context.Context, *PrepareSandboxStartRequest) (*PrepareSandboxStartResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PrepareSandboxStart not implemented")
+}
+func (UnimplementedOpenShellServer) SetManagedSandboxRunning(context.Context, *SetManagedSandboxRunningRequest) (*SandboxResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetManagedSandboxRunning not implemented")
 }
 func (UnimplementedOpenShellServer) CreateSshSession(context.Context, *CreateSshSessionRequest) (*CreateSshSessionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateSshSession not implemented")
@@ -1603,6 +1639,42 @@ func _OpenShell_StartSandbox_Handler(srv interface{}, ctx context.Context, dec f
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(OpenShellServer).StartSandbox(ctx, req.(*StartSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_PrepareSandboxStart_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PrepareSandboxStartRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).PrepareSandboxStart(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_PrepareSandboxStart_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).PrepareSandboxStart(ctx, req.(*PrepareSandboxStartRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_SetManagedSandboxRunning_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetManagedSandboxRunningRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).SetManagedSandboxRunning(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_SetManagedSandboxRunning_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).SetManagedSandboxRunning(ctx, req.(*SetManagedSandboxRunningRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2564,6 +2636,14 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "StartSandbox",
 			Handler:    _OpenShell_StartSandbox_Handler,
+		},
+		{
+			MethodName: "PrepareSandboxStart",
+			Handler:    _OpenShell_PrepareSandboxStart_Handler,
+		},
+		{
+			MethodName: "SetManagedSandboxRunning",
+			Handler:    _OpenShell_SetManagedSandboxRunning_Handler,
 		},
 		{
 			MethodName: "CreateSshSession",

@@ -1569,6 +1569,16 @@ impl DockerComputeDriver {
 
 #[tonic::async_trait]
 impl ComputeDriver for DockerComputeDriver {
+    async fn prepare_sandbox_start(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::PrepareSandboxStartRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::PrepareSandboxStartResponse>, Status>
+    {
+        Err(Status::unimplemented(
+            "sandbox credential preparation is unavailable",
+        ))
+    }
+
     type WatchSandboxesStream = WatchStream;
 
     async fn get_capabilities(

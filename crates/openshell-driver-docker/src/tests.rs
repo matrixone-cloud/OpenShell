@@ -45,6 +45,7 @@ fn test_sandbox() -> DriverSandbox {
             }),
             resource_requirements: None,
             sandbox_token: String::new(),
+            command: Vec::new(),
         }),
         status: None,
         workspace: String::new(),

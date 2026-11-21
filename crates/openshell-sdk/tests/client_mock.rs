@@ -100,6 +100,24 @@ fn workspace_proto(name: &str, phase: proto::datamodel::v1::WorkspacePhase) -> p
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn set_managed_sandbox_running(
+        &self,
+        _request: tonic::Request<proto::SetManagedSandboxRunningRequest>,
+    ) -> Result<Response<proto::SandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "sandbox credential preparation is unavailable",
+        ))
+    }
+
+    async fn prepare_sandbox_start(
+        &self,
+        _request: tonic::Request<proto::PrepareSandboxStartRequest>,
+    ) -> Result<Response<proto::PrepareSandboxStartResponse>, Status> {
+        Err(Status::unimplemented(
+            "sandbox credential preparation is unavailable",
+        ))
+    }
+
     async fn get_current_user(
         &self,
         _request: tonic::Request<proto::GetCurrentUserRequest>,

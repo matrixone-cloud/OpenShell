@@ -50,6 +50,10 @@ spec:
         - {{ .Values.server.dbUrl | quote }}
         {{- end }}
       env:
+        {{- if and (eq (.Values.server.drivers.kubernetes.workspaceMode | default "shared") "shared") .Values.server.drivers.kubernetes.allowRunnerStartupSecrets }}
+        - name: OPENSHELL_MANAGED_RUNNER_LIFECYCLE
+          value: "true"
+        {{- end }}
         {{- if not (or .Values.server.credentialDrivers.kubernetesSecrets.enabled .Values.server.credentialDrivers.vault.enabled) }}
         - name: {{ include "openshell.credentialStorageKeyEncryptionKeyEnvName" . }}
           valueFrom:

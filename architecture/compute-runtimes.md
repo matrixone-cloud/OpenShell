@@ -34,6 +34,25 @@ The Kubernetes driver checks unrestricted-network admission in that preflight
 and returns `INVALID_ARGUMENT` when the operator has not enabled it. It repeats
 the admission check in the create path before writing Kubernetes resources.
 
+## Managed Runner start credentials
+
+The shared Kubernetes gateway advertises the managed runner lifecycle on sandbox
+reads when `server.drivers.kubernetes.allowRunnerStartupSecrets` is enabled.
+Managed and operator workspace modes do not enable this Helm integration. Leave
+the opt-in off until all Gateway replicas support the dedicated lifecycle RPCs.
+Existing Start clients can still start sandboxes stopped through the legacy
+lifecycle.
+
+The driver writes an owned Secret and updates the existing Sandbox Pod template.
+The Sandbox and workspace PVC survive. MOI activates the prepared credential
+before requesting Start for the same stop operation. Kubernetes expands the
+credential references in the SSH environment snapshot at Pod startup. The
+snapshot keeps its string-map format for supervisors in existing Pod templates.
+
+Resume any Runner stopped through the managed protocol before disabling the
+opt-in or rolling back the gateway. Verify that its Edge has connected before
+proceeding.
+
 ## Sandbox Readiness Composition
 
 The gateway composes driver backend state with supervisor session presence to
