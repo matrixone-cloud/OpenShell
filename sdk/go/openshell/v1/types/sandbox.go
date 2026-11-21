@@ -23,6 +23,7 @@ type Sandbox struct {
 type SandboxSpec struct {
 	LogLevel    string
 	Environment map[string]string
+	Command     []string
 	Template    *SandboxTemplate
 	Providers   []string
 	GPUCount    *uint32

@@ -150,6 +150,20 @@ mod tests {
     }
 
     #[test]
+    fn managed_lifecycle_requires_workspace_admin() {
+        for path in [
+            "/openshell.v1.OpenShell/PrepareSandboxStart",
+            "/openshell.v1.OpenShell/SetManagedSandboxRunning",
+        ] {
+            let entry = lookup(path).expect("managed lifecycle must declare authority");
+            assert_eq!(entry.auth_mode, AuthMode::Bearer);
+            assert_eq!(entry.scope.as_deref(), Some("sandbox:write"));
+            assert_eq!(entry.workspace_role.as_deref(), Some("admin"));
+            assert!(!is_sandbox_callable(path));
+        }
+    }
+
+    #[test]
     fn sandbox_lifecycle_mutations_require_user_write_authority() {
         for path in [
             "/openshell.v1.OpenShell/StopSandbox",

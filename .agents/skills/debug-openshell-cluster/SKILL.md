@@ -244,6 +244,12 @@ When `userns` is configured (e.g. `userns = "auto"` or `userns = "keep-id"`):
 
 ### Step 6: Check Kubernetes Helm Gateways
 
+Managed Runner credential-aware stop/start is opt-in for shared Kubernetes gateways.
+Check `server.drivers.kubernetes.allowRunnerStartupSecrets` on the Helm release and
+the matching Secret permissions. During a mixed-version rollout, older gateways
+return `UNIMPLEMENTED` for the managed lifecycle RPCs. Existing Start clients
+continue to work for sandboxes stopped through the legacy protocol.
+
 ```bash
 helm -n openshell status openshell
 helm -n openshell get values openshell

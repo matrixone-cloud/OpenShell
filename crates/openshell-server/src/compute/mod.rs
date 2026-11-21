@@ -145,6 +145,43 @@ mod traced_driver {
     }
 }
 
+const STOP_EPOCH_ANNOTATION: &str = "openshell.io/stop-epoch";
+const PREPARED_STOP_EPOCH_ANNOTATION: &str = "openshell.io/prepared-stop-epoch";
+const MANAGED_STOP_ANNOTATION: &str = "openshell.io/managed-runner-stop";
+
+pub fn is_moi_managed_runner(sandbox: &Sandbox) -> bool {
+    sandbox.object_labels().is_some_and(|labels| {
+        labels
+            .get("moi.sandbox/workspace-id")
+            .is_some_and(|workspace| !workspace.is_empty())
+            && labels
+                .get("moi.sandbox/ephemeral")
+                .is_none_or(|value| value != "true")
+            && labels
+                .get("moi.sandbox/pool")
+                .is_none_or(|value| value != "true")
+    })
+}
+
+fn prepared_stop_epoch(sandbox: &Sandbox) -> Option<u64> {
+    sandbox
+        .metadata
+        .as_ref()?
+        .annotations
+        .get(PREPARED_STOP_EPOCH_ANNOTATION)?
+        .parse()
+        .ok()
+}
+
+fn sandbox_stop_epoch(sandbox: &Sandbox) -> u64 {
+    sandbox
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.annotations.get(STOP_EPOCH_ANNOTATION))
+        .and_then(|epoch| epoch.parse().ok())
+        .unwrap_or_default()
+}
+
 const DELETE_PHASE_CAS_RETRY_LIMIT: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -475,6 +512,16 @@ impl RemoteComputeDriver {
 
 #[tonic::async_trait]
 impl ComputeDriver for RemoteComputeDriver {
+    async fn prepare_sandbox_start(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::PrepareSandboxStartRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::PrepareSandboxStartResponse>,
+        Status,
+    > {
+        self.client().prepare_sandbox_start(request).await
+    }
+
     type WatchSandboxesStream = DriverWatchStream;
 
     async fn get_capabilities(
@@ -1050,6 +1097,15 @@ impl ComputeRuntime {
         workspace: &str,
         name: &str,
     ) -> Result<Sandbox, Status> {
+        self.stop_sandbox_with_mode(workspace, name, false).await
+    }
+
+    pub(crate) async fn stop_sandbox_with_mode(
+        &self,
+        workspace: &str,
+        name: &str,
+        managed: bool,
+    ) -> Result<Sandbox, Status> {
         let candidate = self
             .store
             .get_message_by_name::<Sandbox>(workspace, name)
@@ -1073,6 +1129,11 @@ impl ComputeRuntime {
         }
 
         let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
+        if managed && !is_moi_managed_runner(&current) {
+            return Err(Status::failed_precondition(
+                "sandbox is not a managed runner",
+            ));
+        }
         if phase == SandboxPhase::Stopped {
             self.cleanup_stopped_sandbox_sessions(&current)
                 .await
@@ -1097,6 +1158,7 @@ impl ComputeRuntime {
                     SandboxPhase::Stopping,
                     "Stopping",
                     "Sandbox stop requested",
+                    managed,
                 )
                 .await?;
             self.sandbox_index.update_from_sandbox(&stopping);
@@ -1175,6 +1237,7 @@ impl ComputeRuntime {
                         SandboxPhase::Stopped,
                         "Stopped",
                         "Sandbox compute is stopped",
+                        false,
                     )
                     .await?
                 } else {
@@ -1200,10 +1263,106 @@ impl ComputeRuntime {
         }
     }
 
+    pub(crate) async fn prepare_sandbox_start(
+        &self,
+        workspace: &str,
+        name: &str,
+        expected_stop_epoch: u64,
+        credential_generation: u64,
+        edge_token: String,
+    ) -> Result<(), Status> {
+        let candidate = self
+            .store
+            .get_message_by_name::<Sandbox>(workspace, name)
+            .await
+            .map_err(|_| Status::internal("could not load sandbox"))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let sandbox_id = candidate.object_id().to_string();
+        let lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
+        let current = self
+            .store
+            .get_message::<Sandbox>(&sandbox_id)
+            .await
+            .map_err(|_| Status::internal("could not load sandbox"))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        if current.object_name() != name || current.object_workspace() != workspace {
+            return Err(Status::aborted("sandbox identity changed"));
+        }
+        if !is_moi_managed_runner(&current) {
+            return Err(Status::failed_precondition(
+                "sandbox is not a managed runner",
+            ));
+        }
+        if current.phase() != SandboxPhase::Stopped as i32
+            || sandbox_stop_epoch(&current) != expected_stop_epoch
+        {
+            return Err(Status::failed_precondition(
+                "sandbox stop operation changed",
+            ));
+        }
+        self.driver
+            .call(
+                "driver.prepare_sandbox_start",
+                Some(&sandbox_id),
+                |driver| {
+                    let request = openshell_core::proto::compute::v1::PrepareSandboxStartRequest {
+                        sandbox_id: sandbox_id.clone(),
+                        credential_generation,
+                        edge_token: edge_token.clone(),
+                    };
+                    async move { driver.prepare_sandbox_start(Request::new(request)).await }
+                },
+            )
+            .await?;
+        let _global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
+        let latest = self
+            .store
+            .get_message::<Sandbox>(&sandbox_id)
+            .await
+            .map_err(|_| Status::internal("could not read prepared sandbox"))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        if latest.phase() != SandboxPhase::Stopped as i32
+            || sandbox_stop_epoch(&latest) != expected_stop_epoch
+        {
+            return Err(Status::failed_precondition(
+                "sandbox stop operation changed",
+            ));
+        }
+        if prepared_stop_epoch(&latest) != Some(expected_stop_epoch) {
+            self.store
+                .update_message_cas::<Sandbox, _>(
+                    &sandbox_id,
+                    sandbox_resource_version(&latest),
+                    |sandbox| {
+                        if let Some(metadata) = sandbox.metadata.as_mut() {
+                            metadata.annotations.insert(
+                                PREPARED_STOP_EPOCH_ANNOTATION.to_string(),
+                                expected_stop_epoch.to_string(),
+                            );
+                        }
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    crate::grpc::persistence_error_to_status(error, "mark sandbox start prepared")
+                })?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn start_sandbox(
         &self,
         workspace: &str,
         name: &str,
+    ) -> Result<Sandbox, Status> {
+        self.start_sandbox_with_epoch(workspace, name, None).await
+    }
+
+    pub(crate) async fn start_sandbox_with_epoch(
+        &self,
+        workspace: &str,
+        name: &str,
+        expected_stop_epoch: Option<u64>,
     ) -> Result<Sandbox, Status> {
         let candidate = self
             .store
@@ -1228,6 +1387,28 @@ impl ComputeRuntime {
         }
 
         let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
+        if expected_stop_epoch.is_some_and(|epoch| epoch != sandbox_stop_epoch(&current)) {
+            return Err(Status::failed_precondition(
+                "sandbox stop operation changed",
+            ));
+        }
+        if let Some(epoch) = expected_stop_epoch {
+            if !is_moi_managed_runner(&current) || prepared_stop_epoch(&current) != Some(epoch) {
+                return Err(Status::failed_precondition(
+                    "managed runner credentials must be prepared before start",
+                ));
+            }
+        } else if phase != SandboxPhase::Ready && is_moi_managed_runner(&current) {
+            let managed_stop = current
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.annotations.contains_key(MANAGED_STOP_ANNOTATION));
+            if managed_stop || prepared_stop_epoch(&current).is_some() {
+                return Err(Status::failed_precondition(
+                    "use the managed runner start protocol",
+                ));
+            }
+        }
         if phase == SandboxPhase::Ready {
             return Ok(current);
         }
@@ -1249,6 +1430,7 @@ impl ComputeRuntime {
                     SandboxPhase::Starting,
                     "Starting",
                     "Sandbox start requested",
+                    false,
                 )
                 .await?;
             self.sandbox_index.update_from_sandbox(&starting);
@@ -1429,17 +1611,34 @@ impl ComputeRuntime {
         phase: SandboxPhase,
         reason: &str,
         message: &str,
+        managed_stop: bool,
     ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
         let expected_resource_version = sandbox_resource_version(sandbox);
         let reason = reason.to_string();
         let message = message.to_string();
+        let stop_epoch =
+            (phase == SandboxPhase::Stopping).then(|| expected_resource_version.to_string());
         self.store
             .update_message_cas::<Sandbox, _>(
                 &sandbox_id,
                 expected_resource_version,
                 move |sandbox| {
                     sandbox.set_phase(phase as i32);
+                    if let (Some(epoch), Some(metadata)) = (&stop_epoch, sandbox.metadata.as_mut())
+                    {
+                        metadata
+                            .annotations
+                            .insert(STOP_EPOCH_ANNOTATION.to_string(), epoch.clone());
+                        metadata.annotations.remove(PREPARED_STOP_EPOCH_ANNOTATION);
+                        if managed_stop {
+                            metadata
+                                .annotations
+                                .insert(MANAGED_STOP_ANNOTATION.to_string(), epoch.clone());
+                        } else {
+                            metadata.annotations.remove(MANAGED_STOP_ANNOTATION);
+                        }
+                    }
                     let name = sandbox.object_name().to_string();
                     upsert_ready_condition(
                         &mut sandbox.status,
@@ -2235,6 +2434,7 @@ impl ComputeRuntime {
                                 SandboxPhase::Stopped,
                                 "Stopped",
                                 "Sandbox compute is stopped",
+                                false,
                             )
                             .await
                         {
@@ -3196,6 +3396,7 @@ fn driver_sandbox_spec_from_public(
     Ok(DriverSandboxSpec {
         log_level: spec.log_level.clone(),
         environment: spec.environment.clone(),
+        command: spec.command.clone(),
         template: spec
             .template
             .as_ref()
@@ -3841,6 +4042,18 @@ impl NoopTestDriver {
 #[cfg(test)]
 #[tonic::async_trait]
 impl ComputeDriver for NoopTestDriver {
+    async fn prepare_sandbox_start(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::PrepareSandboxStartRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::PrepareSandboxStartResponse>,
+        Status,
+    > {
+        Err(Status::unimplemented(
+            "sandbox credential preparation is unavailable",
+        ))
+    }
+
     type WatchSandboxesStream = DriverWatchStream;
 
     async fn get_capabilities(
@@ -4147,6 +4360,18 @@ mod tests {
 
     #[tonic::async_trait]
     impl ComputeDriver for TestDriver {
+        async fn prepare_sandbox_start(
+            &self,
+            _request: Request<openshell_core::proto::compute::v1::PrepareSandboxStartRequest>,
+        ) -> Result<
+            tonic::Response<openshell_core::proto::compute::v1::PrepareSandboxStartResponse>,
+            Status,
+        > {
+            Err(Status::unimplemented(
+                "sandbox credential preparation is unavailable",
+            ))
+        }
+
         type WatchSandboxesStream = DriverWatchStream;
 
         async fn get_capabilities(
@@ -4445,6 +4670,18 @@ mod tests {
 
     #[tonic::async_trait]
     impl ComputeDriver for ControlledDriver {
+        async fn prepare_sandbox_start(
+            &self,
+            _request: Request<openshell_core::proto::compute::v1::PrepareSandboxStartRequest>,
+        ) -> Result<
+            tonic::Response<openshell_core::proto::compute::v1::PrepareSandboxStartResponse>,
+            Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::compute::v1::PrepareSandboxStartResponse {},
+            ))
+        }
+
         type WatchSandboxesStream = DriverWatchStream;
 
         async fn get_capabilities(
@@ -5319,6 +5556,18 @@ mod tests {
 
         #[tonic::async_trait]
         impl ComputeDriver for FailingDriver {
+            async fn prepare_sandbox_start(
+                &self,
+                _request: Request<openshell_core::proto::compute::v1::PrepareSandboxStartRequest>,
+            ) -> Result<
+                tonic::Response<openshell_core::proto::compute::v1::PrepareSandboxStartResponse>,
+                Status,
+            > {
+                Err(Status::unimplemented(
+                    "sandbox credential preparation is unavailable",
+                ))
+            }
+
             type WatchSandboxesStream = DriverWatchStream;
 
             async fn create_sandbox(
@@ -5474,8 +5723,18 @@ mod tests {
         assert_eq!(stopped_again.phase(), SandboxPhase::Stopped as i32);
         assert_eq!(driver.stop_calls(), 1, "stable stop is idempotent");
 
+        let stop_epoch = sandbox_stop_epoch(&stopped);
+        assert_ne!(stop_epoch, 0);
+        assert_eq!(sandbox_stop_epoch(&stopped_again), stop_epoch);
+        let stale = runtime
+            .start_sandbox_with_epoch("default", sandbox.object_name(), Some(0))
+            .await
+            .unwrap_err();
+        assert_eq!(stale.code(), Code::FailedPrecondition);
+        assert_eq!(driver.start_calls(), 0);
+
         let starting = runtime
-            .start_sandbox("default", sandbox.object_name())
+            .start_sandbox_with_epoch("default", sandbox.object_name(), Some(stop_epoch))
             .await
             .unwrap();
         assert_eq!(starting.phase(), SandboxPhase::Starting as i32);
@@ -5506,6 +5765,90 @@ mod tests {
             .unwrap();
         assert_eq!(ready.phase(), SandboxPhase::Ready as i32);
         assert_eq!(driver.start_calls(), 2, "ready start is idempotent");
+    }
+
+    #[tokio::test]
+    async fn managed_runner_start_requires_preparation_and_explicit_epoch() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox = sandbox_record("sb-managed", "managed", SandboxPhase::Stopped);
+        let metadata = sandbox.metadata.as_mut().unwrap();
+        metadata
+            .labels
+            .insert("moi.sandbox/workspace-id".to_string(), "test".to_string());
+        metadata
+            .annotations
+            .insert(STOP_EPOCH_ANNOTATION.to_string(), "7".to_string());
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let err = runtime
+            .start_sandbox_with_epoch("default", "managed", Some(7))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        runtime
+            .prepare_sandbox_start("default", "managed", 7, 1, "fixture".to_string())
+            .await
+            .unwrap();
+
+        let err = runtime
+            .start_sandbox("default", "managed")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(driver.start_calls(), 0);
+        let starting = runtime
+            .start_sandbox_with_epoch("default", "managed", Some(7))
+            .await
+            .unwrap();
+        assert_eq!(starting.phase(), SandboxPhase::Starting as i32);
+        assert_eq!(driver.start_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_managed_runner_start_survives_gateway_upgrade() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox =
+            sandbox_record("sb-legacy-managed", "legacy-managed", SandboxPhase::Stopped);
+        sandbox
+            .metadata
+            .as_mut()
+            .unwrap()
+            .labels
+            .insert("moi.sandbox/workspace-id".to_string(), "test".to_string());
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let starting = runtime
+            .start_sandbox("default", "legacy-managed")
+            .await
+            .unwrap();
+        assert_eq!(starting.phase(), SandboxPhase::Starting as i32);
+        assert_eq!(driver.start_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn managed_stop_requires_prepared_start_even_for_legacy_clients() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox = sandbox_record("sb-enrolled", "enrolled", SandboxPhase::Ready);
+        sandbox
+            .metadata
+            .as_mut()
+            .unwrap()
+            .labels
+            .insert("moi.sandbox/workspace-id".to_string(), "test".to_string());
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let stopped = runtime
+            .stop_sandbox_with_mode("default", "enrolled", true)
+            .await
+            .unwrap();
+        assert_eq!(stopped.phase(), SandboxPhase::Stopped as i32);
+        let error = runtime
+            .start_sandbox("default", "enrolled")
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert_eq!(driver.start_calls(), 0);
     }
 
     #[tokio::test]

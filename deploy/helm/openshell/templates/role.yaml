@@ -43,4 +43,15 @@ rules:
       - pods
     verbs:
       - get
+  {{- if .Values.server.drivers.kubernetes.allowRunnerStartupSecrets }}
+  # Scoped to the shared sandbox namespace and bound only to the gateway.
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - create
+      - get
+      - update
+  {{- end }}
 {{- end }}

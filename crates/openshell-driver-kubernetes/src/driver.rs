@@ -1588,6 +1588,135 @@ impl KubernetesComputeDriver {
             .map(|_| ())
     }
 
+    pub(crate) async fn prepare_sandbox_start(
+        &self,
+        sandbox_id: &str,
+        generation: u64,
+        token: String,
+    ) -> Result<(), KubernetesDriverError> {
+        if sandbox_id.is_empty() || generation == 0 || !startup_token_is_json_safe(&token) {
+            return Err(KubernetesDriverError::InvalidArgument(
+                "invalid sandbox startup credential".to_string(),
+            ));
+        }
+        let lookup = self
+            .supported_sandbox_api_for_lookup(self.client.clone())
+            .await
+            .map_err(KubernetesDriverError::Message)?;
+        let selector = self.sandbox_lookup_selector(sandbox_id);
+        let object = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            lookup.api.list(&ListParams::default().labels(&selector)),
+        )
+        .await
+        .map_err(|_| startup_credential_io_error())?
+        .map_err(|_| startup_credential_io_error())?
+        .items
+        .into_iter()
+        .next()
+        .ok_or(KubernetesDriverError::NotFound)?;
+        let field_missing = || {
+            KubernetesDriverError::Precondition("sandbox object metadata is incomplete".to_string())
+        };
+        let namespace = object
+            .metadata
+            .namespace
+            .as_deref()
+            .ok_or_else(field_missing)?;
+        let name = object.metadata.name.as_deref().ok_or_else(field_missing)?;
+        let uid = object.metadata.uid.as_deref().ok_or_else(field_missing)?;
+        let secret_name = format!("moi-runner-{uid}");
+        let patch =
+            startup_credential_patch(&object, &lookup.resource.version, &secret_name, generation)?;
+        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+        let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+            api_version: lookup.resource.api_version.clone(),
+            kind: lookup.resource.kind.clone(),
+            name: name.to_string(),
+            uid: uid.to_string(),
+            ..Default::default()
+        };
+
+        tokio::time::timeout(KUBE_API_TIMEOUT, async {
+            let current = secrets
+                .get_opt(&secret_name)
+                .await
+                .map_err(|_| startup_credential_io_error())?;
+            let mut secret = Secret {
+                metadata: ObjectMeta {
+                    name: Some(secret_name.clone()),
+                    owner_references: Some(vec![owner]),
+                    annotations: Some(BTreeMap::from([(
+                        START_CREDENTIAL_GENERATION.to_string(),
+                        generation.to_string(),
+                    )])),
+                    ..Default::default()
+                },
+                data: Some(BTreeMap::from([(
+                    "token".to_string(),
+                    k8s_openapi::ByteString(token.into_bytes()),
+                )])),
+                ..Default::default()
+            };
+            if let Some(current) = current {
+                if !current
+                    .metadata
+                    .owner_references
+                    .as_ref()
+                    .is_some_and(|refs| refs.len() == 1 && refs[0].uid == uid)
+                {
+                    return Err(KubernetesDriverError::Precondition(
+                        "startup credential has an unexpected owner".to_string(),
+                    ));
+                }
+                let old_generation = startup_credential_generation(&current.metadata)?;
+                if old_generation > generation {
+                    return Err(KubernetesDriverError::Precondition(
+                        "startup credential generation is stale".to_string(),
+                    ));
+                }
+                if old_generation == generation && current.data != secret.data {
+                    return Err(KubernetesDriverError::Precondition(
+                        "startup credential differs for the same generation".to_string(),
+                    ));
+                }
+                if old_generation < generation {
+                    secret.metadata.resource_version = Some(
+                        current
+                            .metadata
+                            .resource_version
+                            .ok_or_else(field_missing)?,
+                    );
+                    secrets
+                        .replace(&secret_name, &PostParams::default(), &secret)
+                        .await
+                        .map_err(|_| startup_credential_io_error())?;
+                }
+            } else {
+                secrets
+                    .create(&PostParams::default(), &secret)
+                    .await
+                    .map_err(|_| startup_credential_io_error())?;
+            }
+
+            if let Some(patch) = patch {
+                let api = Self::agent_sandbox_api(
+                    self.client.clone(),
+                    &lookup.resource.version,
+                    namespace,
+                );
+                api.api
+                    .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+                    .await
+                    .map_err(|_| startup_credential_io_error())?;
+            }
+
+            Ok(())
+        })
+        .await
+        .map_err(|_| startup_credential_io_error())?
+    }
+
     async fn patch_sandbox_operating_state(
         &self,
         sandbox_id: &str,
@@ -3461,6 +3590,24 @@ fn sandbox_to_k8s_spec(
         );
     }
 
+    if let Some(spec) = spec.filter(|spec| !spec.command.is_empty()) {
+        let agent = root
+            .get_mut("podTemplate")
+            .and_then(|template| template.pointer_mut("/spec/containers"))
+            .and_then(|containers| containers.as_array_mut())
+            .and_then(|containers| {
+                containers
+                    .iter_mut()
+                    .find(|container| container["name"] == "agent")
+            })
+            .ok_or_else(|| "sandbox has no agent container for its startup command".to_string())?;
+        agent["args"] = serde_json::json!(
+            std::iter::once("--")
+                .chain(spec.command.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+        );
+    }
+
     Ok(serde_json::Value::Object(
         std::iter::once(("spec".to_string(), serde_json::Value::Object(root))).collect(),
     ))
@@ -4337,6 +4484,133 @@ fn next_stop_poll_interval(current: Duration) -> Duration {
     current.saturating_mul(2).min(STOP_MAX_POLL_INTERVAL)
 }
 
+const START_CREDENTIAL_GENERATION: &str = "openshell.io/start-credential-generation";
+
+// Secret values are interpolated into a JSON string at Pod startup.
+fn startup_token_is_json_safe(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 16 * 1024
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn startup_credential_io_error() -> KubernetesDriverError {
+    KubernetesDriverError::Message(
+        "Kubernetes could not persist the sandbox startup credential".to_string(),
+    )
+}
+
+fn startup_credential_generation(metadata: &ObjectMeta) -> Result<u64, KubernetesDriverError> {
+    metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(START_CREDENTIAL_GENERATION))
+        .map(|value| {
+            value.parse().map_err(|_| {
+                KubernetesDriverError::Precondition(
+                    "invalid stored startup credential generation".to_string(),
+                )
+            })
+        })
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+fn startup_credential_patch(
+    sandbox: &DynamicObject,
+    api_version: &str,
+    secret_name: &str,
+    generation: u64,
+) -> Result<Option<serde_json::Value>, KubernetesDriverError> {
+    let spec = &sandbox.data["spec"];
+    let stopped = if api_version == SANDBOX_VERSION_V1BETA1 {
+        spec["operatingMode"].as_str() == Some("Suspended")
+    } else {
+        spec["replicas"].as_u64() == Some(0)
+    };
+    if !stopped {
+        return Err(KubernetesDriverError::Precondition(
+            "sandbox must be stopped to prepare credentials".to_string(),
+        ));
+    }
+
+    let current_generation = startup_credential_generation(&sandbox.metadata)?;
+    match generation.cmp(&current_generation) {
+        std::cmp::Ordering::Less => {
+            return Err(KubernetesDriverError::Precondition(
+                "startup credential generation is stale".to_string(),
+            ));
+        }
+        std::cmp::Ordering::Equal => return Ok(None),
+        std::cmp::Ordering::Greater => {}
+    }
+
+    let invalid_template = || {
+        KubernetesDriverError::Precondition(
+            "sandbox has no managed runner pod template".to_string(),
+        )
+    };
+    let resource_version = sandbox
+        .metadata
+        .resource_version
+        .as_deref()
+        .ok_or_else(invalid_template)?;
+    let mut containers = spec["podTemplate"]["spec"]["containers"]
+        .as_array()
+        .ok_or_else(invalid_template)?
+        .clone();
+    let env = containers
+        .first_mut()
+        .and_then(|container| container["env"].as_array_mut())
+        .ok_or_else(invalid_template)?;
+    if !env.iter().any(|entry| entry["name"] == "ASTRA_EDGE_ID") {
+        return Err(invalid_template());
+    }
+    let snapshot_name = openshell_core::sandbox_env::USER_ENVIRONMENT;
+    let mut snapshot_index = env
+        .iter()
+        .position(|entry| entry["name"] == snapshot_name)
+        .unwrap_or(env.len());
+    let mut snapshot: BTreeMap<String, String> = if let Some(entry) = env.get(snapshot_index) {
+        entry["value"]
+            .as_str()
+            .and_then(|value| serde_json::from_str(value).ok())
+            .ok_or_else(invalid_template)?
+    } else {
+        BTreeMap::new()
+    };
+
+    // Kubelet expands references to earlier env entries. Preserve the JSON
+    // string map expected by old supervisors without storing any token in it.
+    for name in openshell_core::sandbox_env::MOI_RUNNER_CREDENTIAL_NAMES {
+        let reference = serde_json::json!({
+            "name": name,
+            "valueFrom": {"secretKeyRef": {"name": secret_name, "key": "token"}},
+        });
+        match env.iter().position(|entry| entry["name"] == name) {
+            Some(index) if index < snapshot_index => env[index] = reference,
+            index => {
+                if let Some(index) = index {
+                    env.remove(index);
+                }
+                env.insert(snapshot_index, reference);
+                snapshot_index += 1;
+            }
+        }
+        snapshot.insert(name.to_string(), format!("$({name})"));
+    }
+    let snapshot = serde_json::to_string(&snapshot).map_err(|_| invalid_template())?;
+    upsert_env(env, snapshot_name, &snapshot);
+    Ok(Some(serde_json::json!({
+        "metadata": {
+            "resourceVersion": resource_version,
+            "annotations": { (START_CREDENTIAL_GENERATION): generation.to_string() },
+        },
+        "spec": {"podTemplate": {"spec": {"containers": containers}}},
+    })))
+}
+
 fn sandbox_operating_state_patch(
     api_version: &str,
     resource_version: &str,
@@ -4652,6 +4926,111 @@ mod tests {
             reason: "Failed to parse error data".to_string(),
             code,
         })
+    }
+
+    #[test]
+    fn managed_runner_startup_command_is_preserved_as_argv() {
+        let spec = SandboxSpec {
+            command: vec![
+                "/usr/local/bin/entrypoint".to_string(),
+                "an argument with spaces".to_string(),
+            ],
+            ..SandboxSpec::default()
+        };
+        let cr = sandbox_to_k8s_spec_for_test(Some(&spec), &SandboxPodParams::default());
+        assert_eq!(
+            cr["spec"]["podTemplate"]["spec"]["containers"][0]["args"],
+            serde_json::json!(["--", "/usr/local/bin/entrypoint", "an argument with spaces"]),
+        );
+    }
+
+    #[test]
+    fn startup_credential_interpolation_accepts_only_json_safe_tokens() {
+        assert!(startup_token_is_json_safe("fixture.Payload_1.Signature-2"));
+        for invalid in [
+            "",
+            "fixture\"quote",
+            "fixture\\slash",
+            "fixture$()",
+            "fixture\nline",
+        ] {
+            assert!(!startup_token_is_json_safe(invalid));
+        }
+    }
+
+    #[test]
+    fn prepare_start_replaces_managed_environment_while_stopped() {
+        let mut sandbox: DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": "Sandbox",
+            "metadata": {"name": "runner-example", "resourceVersion": "10"},
+            "spec": {
+                "operatingMode": "Suspended",
+                "podTemplate": {"spec": {
+                    "containers": [{"name": "runner", "env": [
+                        {"name": "ASTRA_EDGE_ID", "value": "runner-example"},
+                        {"name": "ASTRA_TOKEN", "value": "example"},
+                        {"name": "MOI_API_KEY", "value": "example"},
+                        {"name": "OPENSHELL_USER_ENVIRONMENT", "value": r#"{"MOI_API_KEY":"old","KEEP":"custom"}"#}
+                    ]}],
+                    "volumes": [{"name": "workspace"}]
+                }}
+            }
+        }))
+        .unwrap();
+        let patch = startup_credential_patch(&sandbox, SANDBOX_VERSION_V1BETA1, "test-secret", 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(patch["metadata"]["resourceVersion"], "10");
+        assert_eq!(
+            patch["metadata"]["annotations"][START_CREDENTIAL_GENERATION],
+            "2"
+        );
+        assert!(patch["spec"]["operatingMode"].is_null());
+        assert!(patch["spec"]["podTemplate"]["spec"]["volumes"].is_null());
+
+        let env = patch["spec"]["podTemplate"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            env[0],
+            serde_json::json!({"name": "ASTRA_EDGE_ID", "value": "runner-example"})
+        );
+        let snapshot_index = env
+            .iter()
+            .position(|entry| entry["name"] == "OPENSHELL_USER_ENVIRONMENT")
+            .unwrap();
+        // Use the legacy supervisor's string-only parser.
+        let snapshot: std::collections::HashMap<String, String> =
+            serde_json::from_str(env[snapshot_index]["value"].as_str().unwrap()).unwrap();
+        assert_eq!(snapshot["KEEP"], "custom");
+        for key in openshell_core::sandbox_env::MOI_RUNNER_CREDENTIAL_NAMES {
+            let index = env.iter().position(|entry| entry["name"] == key).unwrap();
+            assert!(index < snapshot_index);
+            assert_eq!(snapshot[key], format!("$({key})"));
+            assert_eq!(
+                env[index]["valueFrom"]["secretKeyRef"]["name"],
+                "test-secret"
+            );
+            assert!(env[index].get("value").is_none());
+        }
+
+        sandbox.metadata.annotations = Some(BTreeMap::from([(
+            START_CREDENTIAL_GENERATION.to_string(),
+            "2".to_string(),
+        )]));
+        assert!(
+            startup_credential_patch(&sandbox, SANDBOX_VERSION_V1BETA1, "test-secret", 2)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            startup_credential_patch(&sandbox, SANDBOX_VERSION_V1BETA1, "test-secret", 1).is_err()
+        );
+        sandbox.data["spec"]["operatingMode"] = serde_json::json!("Running");
+        assert!(
+            startup_credential_patch(&sandbox, SANDBOX_VERSION_V1BETA1, "test-secret", 3).is_err()
+        );
     }
 
     #[test]

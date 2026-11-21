@@ -3271,6 +3271,16 @@ impl VmDriver {
 
 #[tonic::async_trait]
 impl ComputeDriver for VmDriver {
+    async fn prepare_sandbox_start(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::PrepareSandboxStartRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::PrepareSandboxStartResponse>, Status>
+    {
+        Err(Status::unimplemented(
+            "sandbox credential preparation is unavailable",
+        ))
+    }
+
     async fn get_capabilities(
         &self,
         _request: Request<GetCapabilitiesRequest>,

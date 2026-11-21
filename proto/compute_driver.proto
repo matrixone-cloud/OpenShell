@@ -46,6 +46,9 @@ service ComputeDriver {
   // Idempotently start platform resources for a stopped sandbox.
   rpc StartSandbox(StartSandboxRequest) returns (StartSandboxResponse);
 
+  // Install startup credentials without starting compute.
+  rpc PrepareSandboxStart(PrepareSandboxStartRequest) returns (PrepareSandboxStartResponse);
+
   // Tear down platform resources for a sandbox.
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
 
@@ -142,6 +145,7 @@ message DriverSandboxSpec {
   // ServiceAccount token bootstrap instead). Never echoed to the public
   // Sandbox proto.
   string sandbox_token = 11 [(openshell.options.v1.secret) = true];
+  repeated string command = 12;
 }
 
 message ResourceRequirements {
@@ -304,6 +308,14 @@ message StartSandboxRequest {
 }
 
 message StartSandboxResponse {}
+
+message PrepareSandboxStartRequest {
+  string sandbox_id = 1;
+  uint64 credential_generation = 2;
+  string edge_token = 3 [(openshell.options.v1.secret) = true];
+}
+
+message PrepareSandboxStartResponse {}
 
 message DeleteSandboxRequest {
   // Stable sandbox ID stored by the gateway.

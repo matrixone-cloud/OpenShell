@@ -338,6 +338,20 @@ impl OpenShell for OpenShellService {
         sandbox::handle_start_sandbox(&self.state, request).await
     }
 
+    async fn set_managed_sandbox_running(
+        &self,
+        request: Request<openshell_core::proto::SetManagedSandboxRunningRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        sandbox::handle_set_managed_sandbox_running(&self.state, request).await
+    }
+
+    async fn prepare_sandbox_start(
+        &self,
+        request: Request<openshell_core::proto::PrepareSandboxStartRequest>,
+    ) -> Result<Response<openshell_core::proto::PrepareSandboxStartResponse>, Status> {
+        sandbox::handle_prepare_sandbox_start(&self.state, request).await
+    }
+
     // --- Exec ---
 
     type ExecSandboxStream = ReceiverStream<Result<ExecSandboxEvent, Status>>;

@@ -143,6 +143,21 @@ impl ComputeDriver for ComputeDriverService {
         Ok(Response::new(StartSandboxResponse {}))
     }
 
+    async fn prepare_sandbox_start(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::PrepareSandboxStartRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::PrepareSandboxStartResponse>, Status>
+    {
+        let req = request.into_inner();
+        self.driver
+            .prepare_sandbox_start(&req.sandbox_id, req.credential_generation, req.edge_token)
+            .await
+            .map_err(|error| Status::from(openshell_core::ComputeDriverError::from(error)))?;
+        Ok(Response::new(
+            openshell_core::proto::compute::v1::PrepareSandboxStartResponse {},
+        ))
+    }
+
     async fn delete_sandbox(
         &self,
         request: Request<DeleteSandboxRequest>,

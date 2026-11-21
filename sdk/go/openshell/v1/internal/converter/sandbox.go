@@ -48,6 +48,7 @@ func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 	result := types.SandboxSpec{
 		LogLevel:    spec.GetLogLevel(),
 		Environment: CopyStringMap(spec.GetEnvironment()),
+		Command:     CopyStringSlice(spec.GetCommand()),
 		Providers:   CopyStringSlice(spec.GetProviders()),
 		Policy:      SandboxPolicyFromProto(spec.GetPolicy()),
 	}
@@ -181,6 +182,7 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 	result := &pb.SandboxSpec{
 		LogLevel:    spec.LogLevel,
 		Environment: CopyStringMap(spec.Environment),
+		Command:     CopyStringSlice(spec.Command),
 		Providers:   CopyStringSlice(spec.Providers),
 		Policy:      SandboxPolicyToProto(spec.Policy),
 	}

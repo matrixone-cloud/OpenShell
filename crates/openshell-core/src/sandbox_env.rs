@@ -130,3 +130,7 @@ pub const OCI_IMAGE_USER: &str = "OPENSHELL_OCI_IMAGE_USER";
 // environment variables: it travels on the supervisor's argv
 // (`--upstream-proxy` and friends), which a sandbox image cannot forge the
 // way it could bake `ENV` values.
+
+/// Workload-projected credentials that may also be inherited by SSH children.
+pub const MOI_RUNNER_CREDENTIAL_NAMES: [&str; 3] =
+    ["ASTRA_TOKEN", "ASTRA_ACCESS_TOKEN", "MOI_API_KEY"];

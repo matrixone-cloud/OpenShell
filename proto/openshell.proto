@@ -126,6 +126,24 @@ service OpenShell {
     };
   }
 
+  // Install credentials for a managed runner while its compute is stopped.
+  rpc PrepareSandboxStart(PrepareSandboxStartRequest) returns (PrepareSandboxStartResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "admin"
+    };
+  }
+
+  // Stop or start a managed runner using credential-aware lifecycle semantics.
+  rpc SetManagedSandboxRunning(SetManagedSandboxRunningRequest) returns (SandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "admin"
+    };
+  }
+
   // Create a short-lived SSH session for a sandbox.
   rpc CreateSshSession(CreateSshSessionRequest) returns (CreateSshSessionResponse) {
     option (openshell.options.v1.authorization) = {
@@ -817,6 +835,8 @@ message SandboxSpec {
   // managed fleet-wide.
   reserved 11;
   reserved "proposal_approval_mode";
+  // Workload argv launched by the Kubernetes supervisor. No shell parsing.
+  repeated string command = 12;
 }
 
 message ResourceRequirements {
@@ -1022,6 +1042,24 @@ message StartSandboxRequest {
   // Workspace scope. Empty defaults to "default".
   string workspace = 2;
 }
+
+message SetManagedSandboxRunningRequest {
+  string name = 1;
+  string workspace = 2;
+  bool running = 3;
+  optional uint64 expected_stop_epoch = 4;
+}
+
+message PrepareSandboxStartRequest {
+  string name = 1;
+  string workspace = 2;
+  // Monotonically increasing for a sandbox. Retries reuse the generation.
+  uint64 credential_generation = 3;
+  string edge_token = 4 [(openshell.options.v1.secret) = true];
+  uint64 expected_stop_epoch = 5;
+}
+
+message PrepareSandboxStartResponse {}
 
 // Sandbox response.
 message SandboxResponse {

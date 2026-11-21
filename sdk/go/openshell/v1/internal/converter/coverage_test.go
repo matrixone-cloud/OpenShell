@@ -25,6 +25,7 @@ func TestConverterCoversAllProtoFields_SandboxSpec(t *testing.T) {
 	handled := fieldSet{
 		"log_level":             true,
 		"environment":           true,
+		"command":               true,
 		"template":              true,
 		"policy":                true,
 		"providers":             true,

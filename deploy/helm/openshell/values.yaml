@@ -253,6 +253,8 @@ server:
       # "managed": auto-creates per-workspace namespaces.
       # "operator": uses pre-provisioned namespaces.
       workspaceMode: "shared"
+      # -- Allow gateway-managed Runner startup Secrets in the shared sandbox namespace.
+      allowRunnerStartupSecrets: false
       # -- K8s label selector for namespace discovery in operator mode.
       # The driver watches namespaces matching this label.
       operatorNamespaceLabel: ""

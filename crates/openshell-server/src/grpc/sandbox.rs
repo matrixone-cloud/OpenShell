@@ -357,6 +357,29 @@ async fn handle_create_sandbox_inner(
     }))
 }
 
+const MANAGED_RUNNER_LIFECYCLE_ANNOTATION: &str = "openshell.io/managed-runner-lifecycle";
+
+fn managed_runner_lifecycle_enabled(state: &ServerState) -> bool {
+    state.compute.driver_kind() == Some(openshell_core::ComputeDriverKind::Kubernetes)
+        && std::env::var("OPENSHELL_MANAGED_RUNNER_LIFECYCLE").as_deref() == Ok("true")
+}
+
+fn project_managed_runner_lifecycle(mut sandbox: Sandbox, enabled: bool) -> Sandbox {
+    let enabled = enabled && crate::compute::is_moi_managed_runner(&sandbox);
+    if let Some(metadata) = sandbox.metadata.as_mut() {
+        metadata
+            .annotations
+            .remove(MANAGED_RUNNER_LIFECYCLE_ANNOTATION);
+        if enabled {
+            metadata.annotations.insert(
+                MANAGED_RUNNER_LIFECYCLE_ANNOTATION.to_string(),
+                "v1".to_string(),
+            );
+        }
+    }
+    sandbox
+}
+
 pub(super) async fn handle_get_sandbox(
     state: &Arc<ServerState>,
     request: Request<GetSandboxRequest>,
@@ -386,7 +409,10 @@ pub(super) async fn handle_get_sandbox(
 
     let sandbox = sandbox.ok_or_else(|| Status::not_found("sandbox not found"))?;
     Ok(Response::new(SandboxResponse {
-        sandbox: Some(sandbox),
+        sandbox: Some(project_managed_runner_lifecycle(
+            sandbox,
+            managed_runner_lifecycle_enabled(state),
+        )),
     }))
 }
 
@@ -454,6 +480,11 @@ pub(super) async fn handle_list_sandboxes(
         }
     };
 
+    let enabled = managed_runner_lifecycle_enabled(state);
+    let sandboxes = sandboxes
+        .into_iter()
+        .map(|sandbox| project_managed_runner_lifecycle(sandbox, enabled))
+        .collect();
     Ok(Response::new(ListSandboxesResponse { sandboxes }))
 }
 
@@ -850,6 +881,91 @@ async fn handle_start_sandbox_inner(
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
     }))
+}
+
+pub(super) async fn handle_set_managed_sandbox_running(
+    state: &Arc<ServerState>,
+    request: Request<openshell_core::proto::SetManagedSandboxRunningRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    if !managed_runner_lifecycle_enabled(state) {
+        return Err(Status::unimplemented(
+            "managed runner lifecycle is unavailable",
+        ));
+    }
+    let req = request.into_inner();
+    if req.name.is_empty() || req.running != req.expected_stop_epoch.is_some() {
+        return Err(Status::invalid_argument(
+            "sandbox name and start epoch are required",
+        ));
+    }
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
+    let sandbox = if req.running {
+        state
+            .compute
+            .start_sandbox_with_epoch(&workspace, &req.name, req.expected_stop_epoch)
+            .await?
+    } else {
+        state
+            .compute
+            .stop_sandbox_with_mode(&workspace, &req.name, true)
+            .await?
+    };
+    Ok(Response::new(SandboxResponse {
+        sandbox: Some(project_managed_runner_lifecycle(sandbox, true)),
+    }))
+}
+
+pub(super) async fn handle_prepare_sandbox_start(
+    state: &Arc<ServerState>,
+    request: Request<openshell_core::proto::PrepareSandboxStartRequest>,
+) -> Result<Response<openshell_core::proto::PrepareSandboxStartResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    if !managed_runner_lifecycle_enabled(state) {
+        return Err(Status::unimplemented(
+            "managed runner lifecycle is unavailable",
+        ));
+    }
+    let req = request.into_inner();
+    if req.name.is_empty() || req.credential_generation == 0 || req.edge_token.is_empty() {
+        return Err(Status::invalid_argument(
+            "sandbox name, generation and token are required",
+        ));
+    }
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
+    state
+        .compute
+        .prepare_sandbox_start(
+            &workspace,
+            &req.name,
+            req.expected_stop_epoch,
+            req.credential_generation,
+            req.edge_token,
+        )
+        .await?;
+    Ok(Response::new(
+        openshell_core::proto::PrepareSandboxStartResponse {},
+    ))
 }
 
 async fn sandbox_by_name(

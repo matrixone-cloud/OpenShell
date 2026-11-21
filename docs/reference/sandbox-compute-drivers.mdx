@@ -341,6 +341,13 @@ allowlist is a trust grant, not a tenant isolation mechanism.
 
 Helm deployments set Kubernetes driver values through the chart.
 
+Set `server.drivers.kubernetes.allowRunnerStartupSecrets` to `true` to enable
+credential-aware managed Runner stop and start in shared workspace mode. This
+setting is off by default and applies to shared workspace mode only. Wait for
+all gateway replicas to support the managed lifecycle before enabling it.
+Resume the affected stopped Runners and verify their Edge connections before
+disabling the setting or rolling back the gateway.
+
 For maintainer-level implementation details, refer to the [Kubernetes driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-kubernetes/README.md).
 
 | Gateway configuration | Helm value | Description |
