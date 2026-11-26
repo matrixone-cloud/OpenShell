@@ -1531,8 +1531,7 @@ impl KubernetesComputeDriver {
         let (agent_sandbox_api, kube_name, pod_name, namespace, stop_timeout) = self
             .patch_sandbox_operating_state(sandbox_id, false)
             .await?;
-        let legacy_pod_api = (agent_sandbox_api.resource.version == SANDBOX_VERSION_V1ALPHA1)
-            .then(|| Api::<Pod>::namespaced(self.client.clone(), &namespace));
+        let pod_api = Api::<Pod>::namespaced(self.client.clone(), &namespace);
 
         let deadline = tokio::time::Instant::now() + stop_timeout;
         let mut poll_interval = STOP_INITIAL_POLL_INTERVAL;
@@ -1563,8 +1562,14 @@ impl KubernetesComputeDriver {
             if let Some(error) = kubernetes_sandbox_stop_failure(&object) {
                 return Err(KubernetesDriverError::Message(error));
             }
-            if let Some(pod_api) = legacy_pod_api.as_ref()
-                && kubernetes_sandbox_pod_is_gone(pod_api, &pod_name, deadline)
+            // Older controllers may omit observedGeneration. A Pod lookup is
+            // then the completion signal, as on v1alpha1.
+            if sandbox_requests_suspend(&object)
+                && (agent_sandbox_api.resource.version == SANDBOX_VERSION_V1ALPHA1
+                    || sandbox_conditions(&object).any(|condition| {
+                        is_suspended_true(condition) && condition["observedGeneration"].is_null()
+                    }))
+                && kubernetes_sandbox_pod_is_gone(&pod_api, &pod_name, deadline)
                     .await
                     .map_err(KubernetesDriverError::Message)?
             {
@@ -4360,16 +4365,9 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
     let status = obj.data.get("status")?;
     let status_obj = status.as_object()?;
 
-    let conditions = status_obj
-        .get("conditions")
-        .and_then(|val| val.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(condition_from_value)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let conditions = current_sandbox_conditions(obj)
+        .filter_map(condition_from_value)
+        .collect();
 
     Some(SandboxStatus {
         sandbox_name: status_obj
@@ -4397,49 +4395,75 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
     })
 }
 
-fn kubernetes_sandbox_has_stopped_condition(obj: &DynamicObject) -> bool {
-    obj.data
-        .get("status")
-        .and_then(|status| status.get("conditions"))
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|conditions| {
-            conditions.iter().any(|condition| {
-                condition.get("type").and_then(serde_json::Value::as_str)
-                    == Some(SANDBOX_SUSPENDED_CONDITION)
-                    && condition
-                        .get("status")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|status| status.eq_ignore_ascii_case("true"))
+fn sandbox_requests_suspend(obj: &DynamicObject) -> bool {
+    let spec = &obj.data["spec"];
+    spec["operatingMode"].as_str().map_or_else(
+        || spec["replicas"].as_u64() == Some(0),
+        |mode| mode == "Suspended",
+    )
+}
+
+fn sandbox_conditions(obj: &DynamicObject) -> impl Iterator<Item = &serde_json::Value> {
+    obj.data["status"]["conditions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+}
+
+fn current_sandbox_conditions(obj: &DynamicObject) -> impl Iterator<Item = &serde_json::Value> {
+    let stopping = sandbox_requests_suspend(obj);
+    sandbox_conditions(obj).filter(move |condition| {
+        let suspended = condition["type"] == SANDBOX_SUSPENDED_CONDITION;
+        if !suspended && condition["type"] != "Ready" {
+            return true;
+        }
+        if (suspended && !stopping)
+            || (stopping && condition["type"] == "Ready" && condition["status"] == "True")
+        {
+            return false;
+        }
+        // A retained Suspended condition can outlive a resume and another stop.
+        // Never publish it as current without the controller's acknowledgement.
+        condition["observedGeneration"]
+            .as_i64()
+            .map_or(!suspended, |generation| {
+                obj.metadata.generation == Some(generation)
             })
-        })
+    })
+}
+
+fn is_suspended_true(condition: &serde_json::Value) -> bool {
+    condition["type"] == SANDBOX_SUSPENDED_CONDITION
+        && condition["status"]
+            .as_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case("true"))
+}
+
+fn kubernetes_sandbox_has_stopped_condition(obj: &DynamicObject) -> bool {
+    current_sandbox_conditions(obj).any(is_suspended_true)
 }
 
 fn kubernetes_sandbox_stop_failure(obj: &DynamicObject) -> Option<String> {
-    obj.data
-        .get("status")?
-        .get("conditions")?
-        .as_array()?
-        .iter()
-        .find_map(|condition| {
-            let is_terminal = condition.get("type").and_then(serde_json::Value::as_str)
-                == Some(SANDBOX_SUSPENDED_CONDITION)
-                && condition
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|status| status.eq_ignore_ascii_case("false"))
-                && condition.get("reason").and_then(serde_json::Value::as_str)
-                    == Some(SANDBOX_SUSPENDED_POD_NOT_OWNED_REASON);
-            if !is_terminal {
-                return None;
-            }
-
-            let message = condition
-                .get("message")
+    current_sandbox_conditions(obj).find_map(|condition| {
+        let is_terminal = condition.get("type").and_then(serde_json::Value::as_str)
+            == Some(SANDBOX_SUSPENDED_CONDITION)
+            && condition
+                .get("status")
                 .and_then(serde_json::Value::as_str)
-                .filter(|message| !message.is_empty())
-                .unwrap_or("backing pod is not owned by this sandbox");
-            Some(format!("Kubernetes sandbox stop rejected: {message}"))
-        })
+                .is_some_and(|status| status.eq_ignore_ascii_case("false"))
+            && condition.get("reason").and_then(serde_json::Value::as_str)
+                == Some(SANDBOX_SUSPENDED_POD_NOT_OWNED_REASON);
+        if !is_terminal {
+            return None;
+        }
+
+        let message = condition
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .filter(|message| !message.is_empty())
+            .unwrap_or("backing pod is not owned by this sandbox");
+        Some(format!("Kubernetes sandbox stop rejected: {message}"))
+    })
 }
 
 async fn kubernetes_sandbox_pod_is_gone(
@@ -5114,12 +5138,50 @@ mod tests {
             "v1alpha1 omits a zero status replica count on the wire; it is not a usable completion signal"
         );
 
+        sandbox.metadata.generation = Some(2);
         sandbox.data = serde_json::json!({
-            "status": {
-                "conditions": [{"type": "Suspended", "status": "True"}]
-            }
+            "spec": {"replicas": 0},
+            "status": {"conditions": [{"type": "Suspended", "status": "True"}]}
         });
+        assert!(!kubernetes_sandbox_has_stopped_condition(&sandbox));
+        sandbox.data["status"]["conditions"][0]["observedGeneration"] = 2.into();
         assert!(kubernetes_sandbox_has_stopped_condition(&sandbox));
+    }
+
+    #[test]
+    fn stop_resume_twice_ignores_retained_conditions() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox", &resource);
+        sandbox.data = serde_json::json!({
+            "spec": {"operatingMode": "Running"},
+            "status": {"conditions": [
+                {"type": "Ready", "status": "True", "observedGeneration": 1},
+                {"type": "Suspended", "status": "True", "observedGeneration": 0}
+            ]}
+        });
+        for stop_generation in [2_i64, 4] {
+            sandbox.metadata.generation = Some(stop_generation);
+            sandbox.data["spec"]["operatingMode"] = "Suspended".into();
+            assert!(!kubernetes_sandbox_has_stopped_condition(&sandbox));
+            assert!(status_from_object(&sandbox).unwrap().conditions.is_empty());
+
+            sandbox.data["status"]["conditions"][1]["observedGeneration"] = stop_generation.into();
+            assert!(kubernetes_sandbox_has_stopped_condition(&sandbox));
+
+            let resume_generation = stop_generation + 1;
+            sandbox.metadata.generation = Some(resume_generation);
+            sandbox.data["spec"]["operatingMode"] = "Running".into();
+            sandbox.data["status"]["conditions"][0]["observedGeneration"] =
+                resume_generation.into();
+            assert!(!kubernetes_sandbox_has_stopped_condition(&sandbox));
+            let conditions = status_from_object(&sandbox).unwrap().conditions;
+            assert_eq!(conditions.len(), 1);
+            assert_eq!(conditions[0].r#type, "Ready");
+        }
     }
 
     #[test]
@@ -5130,12 +5192,15 @@ mod tests {
             SANDBOX_KIND,
         ));
         let mut sandbox = DynamicObject::new("sandbox", &resource);
+        sandbox.metadata.generation = Some(2);
         sandbox.data = serde_json::json!({
+            "spec": {"operatingMode": "Suspended"},
             "status": {
                 "conditions": [{
                     "type": "Suspended",
                     "status": "False",
                     "reason": "PodNotOwned",
+                    "observedGeneration": 2,
                     "message": "Refused to delete pod because it is not owned by this sandbox"
                 }]
             }
@@ -5148,6 +5213,9 @@ mod tests {
             )
         );
 
+        sandbox.metadata.generation = Some(3);
+        assert!(kubernetes_sandbox_stop_failure(&sandbox).is_none());
+        sandbox.metadata.generation = Some(2);
         sandbox.data["status"]["conditions"][0]["status"] = serde_json::json!("Unknown");
         sandbox.data["status"]["conditions"][0]["reason"] = serde_json::json!("PodStateUnknown");
         assert!(
