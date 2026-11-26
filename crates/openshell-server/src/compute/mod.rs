@@ -2404,6 +2404,38 @@ impl ComputeRuntime {
             let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
             match phase {
                 SandboxPhase::Stopped => {
+                    // Older Kubernetes drivers could persist Stopped after a managed
+                    // resume by forwarding Suspended=True from the previous generation.
+                    // Re-read the backend before watchers start. A watch event alone
+                    // must never wake a deliberately stopped runner.
+                    if is_moi_managed_runner(&sandbox)
+                        && prepared_stop_epoch(&sandbox) == Some(sandbox_stop_epoch(&sandbox))
+                        && sandbox.status.as_ref().is_some_and(|status| {
+                            status
+                                .conditions
+                                .iter()
+                                .any(|c| c.r#type == "Suspended" && c.status == "True")
+                        })
+                        && let Ok(Some(live)) = self
+                            .get_driver_sandbox(sandbox.object_id(), sandbox.object_name())
+                            .await
+                        && live.id == sandbox.object_id()
+                        && derive_phase(live.status.as_ref()) == SandboxPhase::Ready
+                    {
+                        if let Err(err) = self
+                            .write_lifecycle_phase(
+                                &sandbox,
+                                SandboxPhase::Starting,
+                                "Starting",
+                                "Waiting for the running supervisor to reconnect",
+                                false,
+                            )
+                            .await
+                        {
+                            warn!(sandbox_id = %sandbox.object_id(), error = %err, "Failed to reconcile the running managed sandbox at startup");
+                        }
+                        continue;
+                    }
                     if let Err(err) = self.cleanup_stopped_sandbox_sessions(&sandbox).await {
                         warn!(sandbox_id = %sandbox.object_id(), error = %err, "Failed to complete recovered sandbox session cleanup");
                     }
@@ -5734,7 +5766,7 @@ mod tests {
         assert_eq!(driver.start_calls(), 0);
 
         let starting = runtime
-            .start_sandbox_with_epoch("default", sandbox.object_name(), Some(stop_epoch))
+            .start_sandbox("default", sandbox.object_name())
             .await
             .unwrap();
         assert_eq!(starting.phase(), SandboxPhase::Starting as i32);
@@ -5917,6 +5949,43 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn startup_recovers_managed_resume_misreported_as_stopped_without_starting_compute() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox = sandbox_record("managed", "managed", SandboxPhase::Stopped);
+        let metadata = sandbox.metadata.as_mut().unwrap();
+        metadata
+            .labels
+            .insert("moi.sandbox/workspace-id".into(), "test".into());
+        for key in [STOP_EPOCH_ANNOTATION, PREPARED_STOP_EPOCH_ANNOTATION] {
+            metadata.annotations.insert(key.into(), "7".into());
+        }
+        sandbox
+            .status
+            .as_mut()
+            .unwrap()
+            .conditions
+            .push(SandboxCondition {
+                r#type: "Suspended".into(),
+                status: "True".into(),
+                ..Default::default()
+            });
+        runtime.store.put_message(&sandbox).await.unwrap();
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
+            ready_driver_sandbox("managed", "managed"),
+        )));
+        runtime.start_persisted_sandboxes().await.unwrap();
+        let recovered = runtime
+            .store
+            .get_message::<Sandbox>("managed")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.phase(), SandboxPhase::Starting as i32);
+        assert_eq!(driver.start_calls(), 0);
     }
 
     #[tokio::test]

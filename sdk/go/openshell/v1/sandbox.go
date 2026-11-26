@@ -6,11 +6,18 @@ package v1
 import (
 	"context"
 
+	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/converter"
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
+	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
 )
 
 // Sandbox represents a sandbox instance.
 type Sandbox = types.Sandbox
+
+// SandboxFromProto converts a raw gateway response using the same mapping as Sandboxes().Get.
+func SandboxFromProto(sandbox *pb.Sandbox) *Sandbox {
+	return converter.SandboxFromProto(sandbox)
+}
 
 // SandboxSpec holds the desired state of a sandbox.
 type SandboxSpec = types.SandboxSpec
